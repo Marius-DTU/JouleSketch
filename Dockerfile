@@ -11,8 +11,12 @@
 #    toolchain version exactly.
 FROM swift:6.4 AS swift
 # Downloaded with curl and checked here, since `swift sdk install <url>`
-# crashes inside the container; installing the local file works.
-RUN swift --version \
+# crashes inside the container; installing the local file works. The image
+# has no curl of its own.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && swift --version \
     && curl -fsSL -o /tmp/wasm.artifactbundle.tar.gz \
        https://download.swift.org/swift-6.4.0-release/wasm-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_wasm.artifactbundle.tar.gz \
     && echo "f07b7be3c586d92d7a07051fc6d303b87ebea67eadc40640ba59d5a8b79aa86d  /tmp/wasm.artifactbundle.tar.gz" | sha256sum -c - \
