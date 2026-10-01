@@ -23,6 +23,8 @@ RUN apt-get update \
     && swift sdk install /tmp/wasm.artifactbundle.tar.gz \
     && swift sdk list \
     && rm /tmp/wasm.artifactbundle.tar.gz
+# JavaScriptKit's code generator (BridgeJS) runs on Node.
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 WORKDIR /src
 COPY Package.swift Package.resolved* ./
 COPY JouleSketch ./JouleSketch
