@@ -584,7 +584,7 @@ function openPopover(request: { item: string; x: number; y: number; width: numbe
   const left = Math.min(sheetRect.left + request.x + request.width + 8, window.innerWidth - 300);
   popover.style.left = `${Math.max(8, left)}px`;
   popover.style.top = `${Math.max(56, Math.min(sheetRect.top + request.y, window.innerHeight - popover.offsetHeight - 8))}px`;
-  (popover.querySelector('[data-field="value"]') ?? popover.querySelector("input"))?.focus();
+  (popover.querySelector<HTMLInputElement>('[data-field="value"]') ?? popover.querySelector("input"))?.focus();
   (popover.querySelector<HTMLInputElement>('[data-field="value"]'))?.select();
 }
 
