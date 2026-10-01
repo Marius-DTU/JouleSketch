@@ -1,4 +1,15 @@
-import SwiftUI
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+import Foundation
+import Observation
+
+/// The size of the drawing sheet, in grid points.
+enum PageSize {
+    static let defaultWidth = 100
+    static let defaultHeight = 100
+    static let range = 10...1000
+}
 
 /// The active drawing tool.
 enum Tool: Hashable, CaseIterable, Identifiable {

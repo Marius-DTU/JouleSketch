@@ -7,12 +7,7 @@ extension UTType {
     static let jouleSketchCircuit = UTType(exportedAs: "dk.mariuskb.joulesketch.circuit")
 }
 
-/// What is stored on disk: JSON with a format version, so the format can
-/// evolve when new components are added.
-nonisolated struct CircuitFile: Codable {
-    var version = 1
-    var circuit: Circuit
-
+nonisolated extension CircuitFile {
     static func decode(_ fileWrapper: FileWrapper) throws -> Circuit {
         guard let data = fileWrapper.regularFileContents else {
             throw CocoaError(.fileReadCorruptFile)

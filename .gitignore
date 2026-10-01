@@ -1,0 +1,12 @@
+# Swift package (web version)
+.build/
+
+# Web version
+Web/app/node_modules/
+Web/app/core/
+Web/app/dist/
+
+.DS_Store
+
+# Xcode per-user state
+xcuserdata/

@@ -1,0 +1,8 @@
+# Only what the Dockerfile needs goes into the build.
+.git
+.build
+*.xcodeproj
+Web/app/node_modules
+Web/app/core
+Web/app/dist
+**/.DS_Store

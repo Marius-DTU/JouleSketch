@@ -1,4 +1,6 @@
+#if canImport(CoreGraphics)
 import CoreGraphics
+#endif
 import Foundation
 
 /// A point on the snapping grid, in whole grid units.
@@ -1381,4 +1383,13 @@ extension Circuit {
         result.inheritedValues.formIntersection(ids)
         return result
     }
+}
+
+// MARK: - File format
+
+/// What is stored on disk: JSON with a format version, so the format can
+/// evolve when new components are added. Shared by the Mac and web versions.
+nonisolated struct CircuitFile: Codable {
+    var version = 1
+    var circuit: Circuit
 }

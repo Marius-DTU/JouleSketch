@@ -44,6 +44,19 @@ struct DocumentTabs: NSViewRepresentable {
                     window.toggleTabBar(nil)
                 }
                 Self.keepAboveDock(window)
+                // TEMP DIAGNOSE
+                if ProcessInfo.processInfo.environment["JS_DIAG"] != nil {
+                    let visible = window.screen?.visibleFrame ?? .zero
+                    print("DIAG screen", window.screen?.frame ?? .zero, "visible", visible)
+                    print("DIAG minSize", window.minSize, "contentMinSize", window.contentMinSize, "frame", window.frame)
+                    window.setFrame(visible, display: true)
+                    print("DIAG after fill", window.frame)
+                    window.setFrame(NSRect(x: 0, y: 0, width: 800, height: 300), display: true)
+                    print("DIAG after small", window.frame)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        print("DIAG later", window.frame, "minSize", window.minSize, "contentMinSize", window.contentMinSize)
+                    }
+                }
             }
         }
 

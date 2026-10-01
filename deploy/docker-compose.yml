@@ -1,0 +1,24 @@
+# Runs on the server. Fetches the finished web version from GitHub and
+# updates it by itself when a new version has been pushed.
+#
+# Once on the server:
+#   docker login ghcr.io -u Marius-DTU      (password: a GitHub token, see Web/README.md)
+#   docker compose up -d
+services:
+  joulesketch:
+    image: ghcr.io/marius-dtu/joulesketch:latest
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+
+  # Looks for a new image every 5 minutes and restarts with it.
+  watchtower:
+    image: nickfedor/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The login from "docker login ghcr.io", to fetch from a private repository.
+      - ~/.docker/config.json:/config.json:ro
+    command: --label-enable --cleanup --interval 300
