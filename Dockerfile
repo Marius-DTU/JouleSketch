@@ -10,9 +10,15 @@
 # 1. The shared Swift code → WebAssembly. The Wasm SDK must match the
 #    toolchain version exactly.
 FROM swift:6.4 AS swift
-RUN swift sdk install \
-    https://download.swift.org/swift-6.4.0-release/wasm-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_wasm.artifactbundle.tar.gz \
-    --checksum f07b7be3c586d92d7a07051fc6d303b87ebea67eadc40640ba59d5a8b79aa86d
+# Downloaded with curl and checked here, since `swift sdk install <url>`
+# crashes inside the container; installing the local file works.
+RUN swift --version \
+    && curl -fsSL -o /tmp/wasm.artifactbundle.tar.gz \
+       https://download.swift.org/swift-6.4.0-release/wasm-sdk/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE_wasm.artifactbundle.tar.gz \
+    && echo "f07b7be3c586d92d7a07051fc6d303b87ebea67eadc40640ba59d5a8b79aa86d  /tmp/wasm.artifactbundle.tar.gz" | sha256sum -c - \
+    && swift sdk install /tmp/wasm.artifactbundle.tar.gz \
+    && swift sdk list \
+    && rm /tmp/wasm.artifactbundle.tar.gz
 WORKDIR /src
 COPY Package.swift Package.resolved* ./
 COPY JouleSketch ./JouleSketch
