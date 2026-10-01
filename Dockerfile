@@ -27,8 +27,12 @@ WORKDIR /src
 COPY Package.swift Package.resolved* ./
 COPY JouleSketch ./JouleSketch
 COPY Web/Bridge ./Web/Bridge
+# The build is very chatty, and Docker cuts long logs off, so the output goes
+# to a file and only the errors and the end are shown if it fails.
 RUN swift package --swift-sdk swift-6.4.0-RELEASE_wasm --allow-writing-to-package-directory \
-    js -c release --product JouleWeb --output Web/app/core
+    js -c release --product JouleWeb --output Web/app/core > /tmp/build.log 2>&1 \
+    || { echo "===== FEJL ====="; grep -n -i -E "error|fatal" /tmp/build.log | head -60; \
+         echo "===== SLUTNING AF LOG ====="; tail -60 /tmp/build.log; exit 1; }
 
 # 2. The page around it.
 FROM node:22-alpine AS web
