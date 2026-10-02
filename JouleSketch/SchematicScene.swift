@@ -423,24 +423,6 @@ struct SchematicScene {
         }
     }
 
-    private mutating func drawGround(at position: GridPoint, rotation: Int, color: SceneColor) {
-        let direction = Ground(position: position, rotation: rotation).direction
-        let point = screenPoint(position)
-        let d = CGPoint(x: direction.x, y: direction.y)
-        let normal = CGPoint(x: -d.y, y: d.x)
-        func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint {
-            CGPoint(
-                x: point.x + d.x * along * unit + normal.x * across * unit,
-                y: point.y + d.y * along * unit + normal.y * across * unit
-            )
-        }
-        var path: [PathOp] = [.move(point), .line(at(0.7, 0))]
-        for (along, halfWidth) in [(0.7, 0.6), (0.95, 0.38), (1.2, 0.16)] as [(CGFloat, CGFloat)] {
-            path += [.move(at(along, -halfWidth)), .line(at(along, halfWidth))]
-        }
-        stroke(path, color, width: max(1, 2 * scale))
-    }
-
     private mutating func drawExcludedAreas() {
         var rects = editor.circuit.excludedAreas.map { area in
             (rect: rect(screenPoint(area.from), screenPoint(area.to)), isSelected: editor.isSelected(.excludedArea(area.id)))
@@ -772,9 +754,78 @@ struct SchematicScene {
 
     // MARK: Symbols
 
-    /// A two-terminal component between `a` and `b`, as in `SymbolRenderer`.
-    /// The symbol body is centered and 2 grid units long; leads fill the rest.
+    /// Draws with a `SymbolPainter` at the sheet's scale and current opacity.
+    private mutating func paint(_ draw: (inout SymbolPainter) -> Void) {
+        var painter = SymbolPainter(unit: unit, resistorStyle: resistorStyle, opacity: opacity)
+        draw(&painter)
+        primitives += painter.primitives
+    }
+
+    private mutating func drawGround(at position: GridPoint, rotation: Int, color: SceneColor) {
+        let direction = Ground(position: position, rotation: rotation).direction
+        let point = screenPoint(position)
+        let width = max(1, 2 * scale)
+        paint { $0.ground(at: point, direction: CGPoint(x: direction.x, y: direction.y), color: color, lineWidth: width) }
+    }
+
     private mutating func drawComponent(
+        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false
+    ) {
+        paint { $0.component(kind, from: a, to: b, color: color, lineWidth: lineWidth, isLit: isLit) }
+    }
+
+    private mutating func drawArrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: SceneColor) {
+        paint { $0.arrowhead(at: point, direction: direction, size: size, color: color) }
+    }
+
+    private mutating func drawMeshArrow(at center: CGPoint, radius: CGFloat, clockwise: Bool, color: SceneColor, lineWidth: CGFloat) {
+        paint { $0.meshArrow(at: center, radius: radius, clockwise: clockwise, color: color, lineWidth: lineWidth) }
+    }
+
+    /// A voltage point: a large dot on the node.
+    private mutating func drawProbe(at point: CGPoint, color: SceneColor) {
+        paint { $0.probe(at: point, color: color) }
+    }
+}
+
+// MARK: - Symbols
+
+/// Draws schematic symbols as primitives, following `SymbolRenderer`.
+/// Used for the sheet and for the palette's tool icons. `unit` is the
+/// on-screen grid spacing.
+nonisolated struct SymbolPainter {
+    var unit: CGFloat
+    var resistorStyle = SceneResistorStyle.iec
+    /// Opacity applied to everything drawn (for previews).
+    var opacity: Double = 1
+
+    private(set) var primitives: [ScenePrimitive] = []
+
+    init(unit: CGFloat, resistorStyle: SceneResistorStyle = .iec, opacity: Double = 1) {
+        self.unit = unit
+        self.resistorStyle = resistorStyle
+        self.opacity = opacity
+    }
+
+    mutating func stroke(_ path: [PathOp], _ color: SceneColor, width: CGFloat) {
+        primitives.append(.stroke(path, color: color.opacity(opacity), width: width))
+    }
+
+    mutating func fill(_ path: [PathOp], _ color: SceneColor) {
+        primitives.append(.fill(path, color: color.opacity(opacity)))
+    }
+
+    mutating func text(_ text: String, size: CGFloat, weight: Int = 600, color: SceneColor, at point: CGPoint, anchor: CGPoint) {
+        primitives.append(.text([TextRun(text: text, size: size, weight: weight, color: color.opacity(opacity))], at: point, anchor: anchor))
+    }
+
+    private func circle(_ p: CGPoint, _ radius: CGFloat) -> PathOp {
+        .ellipse(CGRect(x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2))
+    }
+
+    /// A two-terminal component between `a` and `b`.
+    /// The symbol body is centered and 2 grid units long; leads fill the rest.
+    mutating func component(
         _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false
     ) {
         let length = a.distance(to: b)
@@ -865,8 +916,25 @@ struct SchematicScene {
         }
     }
 
+    /// A ground (0 V) symbol: a short stem from `point` and three bars getting
+    /// narrower, pointing along `direction` (a unit vector).
+    mutating func ground(at point: CGPoint, direction d: CGPoint, color: SceneColor, lineWidth: CGFloat) {
+        let normal = CGPoint(x: -d.y, y: d.x)
+        func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint {
+            CGPoint(
+                x: point.x + d.x * along * unit + normal.x * across * unit,
+                y: point.y + d.y * along * unit + normal.y * across * unit
+            )
+        }
+        var path: [PathOp] = [.move(point), .line(at(0.7, 0))]
+        for (along, halfWidth) in [(0.7, 0.6), (0.95, 0.38), (1.2, 0.16)] as [(CGFloat, CGFloat)] {
+            path += [.move(at(along, -halfWidth)), .line(at(along, halfWidth))]
+        }
+        stroke(path, color, width: lineWidth)
+    }
+
     /// A filled arrowhead centered on `point`, pointing along `direction` (a unit vector).
-    private mutating func drawArrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: SceneColor) {
+    mutating func arrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: SceneColor) {
         let normal = CGPoint(x: -direction.y, y: direction.x)
         let half = size / 2
         let tip = CGPoint(x: point.x + direction.x * half, y: point.y + direction.y * half)
@@ -881,7 +949,7 @@ struct SchematicScene {
     }
 
     /// A curved arrow most of the way round `center`, like one drawn by hand.
-    private mutating func drawMeshArrow(at center: CGPoint, radius: CGFloat, clockwise: Bool, color: SceneColor, lineWidth: CGFloat) {
+    mutating func meshArrow(at center: CGPoint, radius: CGFloat, clockwise: Bool, color: SceneColor, lineWidth: CGFloat) {
         let start = clockwise ? 100.0 : 80.0
         let end = clockwise ? 350.0 : -170.0
         let steps = 40
@@ -889,15 +957,110 @@ struct SchematicScene {
             let angle = (start + (end - start) * Double(step) / Double(steps)) * .pi / 180
             return CGPoint(x: center.x + radius * cos(angle), y: center.y + radius * sin(angle))
         }
-        stroke(polyline(points), color, width: lineWidth)
+        stroke([.move(points[0])] + points.dropFirst().map { .line($0) }, color, width: lineWidth)
         let last = end * .pi / 180
         let tip = CGPoint(x: center.x + radius * cos(last), y: center.y + radius * sin(last))
         let sign: Double = clockwise ? 1 : -1
-        drawArrowhead(at: tip, direction: CGPoint(x: -sin(last) * sign, y: cos(last) * sign), size: max(6, radius * 0.45), color: color)
+        arrowhead(at: tip, direction: CGPoint(x: -sin(last) * sign, y: cos(last) * sign), size: max(6, radius * 0.45), color: color)
     }
 
     /// A voltage point: a large dot on the node.
-    private mutating func drawProbe(at point: CGPoint, color: SceneColor) {
+    mutating func probe(at point: CGPoint, color: SceneColor) {
         fill([circle(point, max(4, unit * 0.38))], color)
+    }
+}
+
+// MARK: - Tool icons
+
+/// The palette's tool icons, drawn like `ToolIcon` with the same symbol code
+/// as the sheet. Icons are `size` points (30 × 24).
+enum ToolIconScene {
+    enum Icon {
+        case tool(Tool)
+        /// Drawing mode's pen and eraser (the web palette lists them as tools).
+        case pen
+        case eraser
+    }
+
+    static let size = CGSize(width: 30, height: 24)
+
+    static func primitives(for icon: Icon, color: SceneColor, resistorStyle: SceneResistorStyle) -> [ScenePrimitive] {
+        let size = size
+        let a = CGPoint(x: 2, y: size.height / 2)
+        let b = CGPoint(x: size.width - 2, y: size.height / 2)
+        let middle = CGPoint(x: size.width / 2, y: size.height / 2)
+        var painter = SymbolPainter(unit: size.width / 4.5, resistorStyle: resistorStyle)
+
+        /// Points given relative to `origin`.
+        func shape(_ origin: CGPoint, _ points: [(CGFloat, CGFloat)]) -> [PathOp] {
+            let moved = points.map { CGPoint(x: origin.x + $0.0, y: origin.y + $0.1) }
+            return [.move(moved[0])] + moved.dropFirst().map { .line($0) } + [.close]
+        }
+
+        switch icon {
+        case .tool(.select):
+            // Like the SF Symbol "cursorarrow".
+            painter.fill(shape(CGPoint(x: 10.8, y: 5.5), [(0, 0), (0, 11), (2.7, 8.6), (4.6, 13), (6.4, 12.2), (4.6, 8), (8.4, 8)]), color)
+        case .tool(.wire):
+            painter.stroke([
+                .move(CGPoint(x: 3, y: size.height - 5)), .line(CGPoint(x: size.width / 2, y: size.height - 5)),
+                .line(CGPoint(x: size.width / 2, y: 5)), .line(CGPoint(x: size.width - 3, y: 5)),
+            ], color, width: 2)
+        case .tool(.component(let kind)):
+            painter.component(kind, from: a, to: b, color: color, lineWidth: 1.5)
+        case .tool(.ground):
+            painter.unit = 14
+            painter.ground(at: CGPoint(x: size.width / 2, y: 3), direction: CGPoint(x: 0, y: 1), color: color, lineWidth: 1.5)
+        case .tool(.current):
+            painter.stroke([.move(a), .line(b)], color, width: 1.5)
+            painter.arrowhead(at: middle, direction: CGPoint(x: 1, y: 0), size: 11, color: color)
+        case .tool(.probe):
+            let dot = CGPoint(x: size.width * 0.28, y: size.height * 0.62)
+            painter.stroke([.move(CGPoint(x: 1, y: dot.y)), .line(CGPoint(x: size.width * 0.55, y: dot.y))], color, width: 1.5)
+            painter.unit = 12
+            painter.probe(at: dot, color: color)
+            painter.text("V", size: 11, color: color, at: CGPoint(x: size.width * 0.62, y: size.height * 0.45), anchor: TextAnchor.leading)
+        case .tool(.equivalent):
+            // A small resistor with "eq" beneath it.
+            painter.unit = size.width / 5
+            painter.component(.resistor, from: CGPoint(x: 2, y: 8), to: CGPoint(x: size.width - 2, y: 8), color: color, lineWidth: 1.5)
+            painter.text("eq", size: 10, color: color, at: CGPoint(x: size.width / 2, y: size.height - 1), anchor: TextAnchor.bottom)
+        case .tool(.power):
+            // A circle with "P" in it.
+            painter.stroke([.ellipse(CGRect(x: middle.x - 10, y: middle.y - 10, width: 20, height: 20))], color, width: 1.5)
+            painter.text("P", size: 11, color: color, at: middle, anchor: TextAnchor.center)
+        case .tool(.mesh):
+            painter.meshArrow(at: middle, radius: size.height * 0.36, clockwise: true, color: color, lineWidth: 1.5)
+            painter.text("I", size: 9, color: color, at: middle, anchor: TextAnchor.center)
+        case .tool(.groupArea):
+            // A tinted box with a name tab in its corner.
+            let box = CGRect(x: 3, y: 3, width: size.width - 6, height: size.height - 6)
+            painter.fill([.roundedRect(box, radius: 2)], color.opacity(0.15))
+            painter.stroke([.roundedRect(box, radius: 2)], color, width: 1.2)
+            painter.fill([.rect(CGRect(x: box.minX, y: box.minY, width: box.width * 0.45, height: 4))], color)
+        case .tool(.text):
+            // Like the SF Symbol "character.textbox".
+            painter.stroke([.roundedRect(CGRect(x: middle.x - 8, y: middle.y - 6, width: 16, height: 12), radius: 2.5)], color, width: 1.2)
+            painter.text("A", size: 9, weight: 500, color: color, at: middle, anchor: TextAnchor.center)
+        case .pen:
+            // Like the SF Symbol "pencil": a pointed body along the diagonal and a cap.
+            let tip = CGPoint(x: 9.5, y: 17.5)
+            let d = CGPoint(x: 0.7071, y: -0.7071), n = CGPoint(x: 0.7071, y: 0.7071)
+            func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint {
+                CGPoint(x: tip.x + d.x * along + n.x * across, y: tip.y + d.y * along + n.y * across)
+            }
+            painter.fill([.move(tip), .line(at(2.6, -1.4)), .line(at(12.4, -1.4)), .line(at(12.4, 1.4)), .line(at(2.6, 1.4)), .close], color)
+            painter.fill([.move(at(13.6, -1.4)), .line(at(15.2, -1.4)), .line(at(15.2, 1.4)), .line(at(13.6, 1.4)), .close], color)
+        case .eraser:
+            // Like the SF Symbol "eraser": a tilted block with a band at its tip.
+            let center = middle
+            let d = CGPoint(x: 0.7071, y: -0.7071), n = CGPoint(x: 0.7071, y: 0.7071)
+            func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint {
+                CGPoint(x: center.x + d.x * along + n.x * across, y: center.y + d.y * along + n.y * across)
+            }
+            painter.stroke([.move(at(-7, -4)), .line(at(7, -4)), .line(at(7, 4)), .line(at(-7, 4)), .close], color, width: 1.4)
+            painter.stroke([.move(at(-3, -4)), .line(at(-3, 4))], color, width: 1.4)
+        }
+        return painter.primitives
     }
 }

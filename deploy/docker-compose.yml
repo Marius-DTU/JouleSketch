@@ -1,9 +1,14 @@
-# Runs on the server. Fetches the finished web version from GitHub and
-# updates it by itself when a new version has been pushed.
+# Runs on the server (e.g. as a Dockge stack). Fetches the finished web
+# version from GitHub and updates it by itself when a new version has been
+# pushed.
 #
-# Once on the server:
-#   docker login ghcr.io -u Marius-DTU      (password: a GitHub token, see Web/README.md)
-#   docker compose up -d
+# The image is private, so a GitHub token with read:packages is needed. Put it
+# in the stack's .env (in Dockge: the ".env" field under the compose text):
+#   GHCR_USER=Marius-DTU
+#   GHCR_TOKEN=ghp_...
+# Watchtower logs in with these by itself. The very first fetch of the
+# joulesketch image is done by Docker, which needs one "docker login ghcr.io"
+# where the stack is started (see Web/README.md).
 services:
   joulesketch:
     image: ghcr.io/marius-dtu/joulesketch:latest
@@ -19,6 +24,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # The login from "docker login ghcr.io", to fetch from a private repository.
-      - ~/.docker/config.json:/config.json:ro
+    environment:
+      - REPO_USER=${GHCR_USER}
+      - REPO_PASS=${GHCR_TOKEN}
     command: --label-enable --cleanup --interval 300

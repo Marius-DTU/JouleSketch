@@ -254,6 +254,23 @@ import JavaScriptKit
         return SceneJSON.encode(scene.build())
     }
 
+    /// A palette icon (30 × 24 points) for a tool id, "pen" or "eraser", as
+    /// scene JSON. White for the picked tool, like the Mac palette.
+    @JS func toolIcon(_ id: String, _ active: Bool) -> String {
+        let icon: ToolIconScene.Icon
+        if id == "pen" {
+            icon = .pen
+        } else if id == "eraser" {
+            icon = .eraser
+        } else if let tool = Tool.allCases.first(where: { $0.id == id }) {
+            icon = .tool(tool)
+        } else {
+            return "[]"
+        }
+        let color = active ? SceneColor(white: 1) : SceneColor(0.114, 0.114, 0.122)
+        return SceneJSON.encode(ToolIconScene.primitives(for: icon, color: color, resistorStyle: resistorStyle))
+    }
+
     /// The state the page shows around the sheet, as JSON.
     @JS func state() -> String {
         let json = JSONWriter()

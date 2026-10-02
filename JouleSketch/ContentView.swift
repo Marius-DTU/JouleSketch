@@ -13,8 +13,76 @@ struct ContentView: View {
     /// Space between the tool palette and the window's sides.
     private static let paletteMargin: CGFloat = 16
     @AppStorage(SettingsKey.studyMode) private var studyMode = false
+    @AppStorage(SettingsKey.walkthroughSideBySide) private var walkthroughSideBySide = false
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    #endif
+
+    /// Whether the walkthrough is shown in a panel beside the sheet. On an
+    /// iPhone there is no room, so it is always a window there.
+    private var walkthroughDocked: Bool {
+        #if os(iOS)
+        walkthroughSideBySide && sizeClass != .compact
+        #else
+        walkthroughSideBySide
+        #endif
+    }
 
     var body: some View {
+        HStack(spacing: 0) {
+            sheet
+            if showMapleExport && walkthroughDocked {
+                Divider()
+                    .ignoresSafeArea(edges: .bottom)
+                // Follows the drawing as it is edited.
+                MapleExportView(circuit: editor.calculationCircuit, isDocked: true) {
+                    showMapleExport = false
+                }
+                .frame(width: 440)
+                // Nothing wider may reach past the window's edge.
+                .clipped()
+                .ignoresSafeArea(edges: .bottom)
+            }
+        }
+        #if os(iOS)
+        .toolbarTitleDisplayMode(.inline)
+        #endif
+        .inspector(isPresented: $showInspector) {
+            InspectorView(editor: editor)
+        }
+        .sheet(isPresented: Binding(
+            get: { showMapleExport && !walkthroughDocked },
+            // Switching to the panel also closes the window; that must
+            // not close the walkthrough.
+            set: { if !$0 && !walkthroughDocked { showMapleExport = false } }
+        )) {
+            // Without what lies in excluded areas.
+            MapleExportView(circuit: editor.calculationCircuit)
+        }
+        .sheet(isPresented: $showSettings) {
+            NavigationStack {
+                SettingsView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Færdig") { showSettings = false }
+                        }
+                    }
+            }
+        }
+        // The document detects unsaved changes (and autosaves) through
+        // the undo actions the editor registers here.
+        .onAppear { editor.undoManager = undoManager }
+        .onChange(of: undoManager) { editor.undoManager = undoManager }
+        #if os(macOS)
+        // Open documents share one window as tabs.
+        .background { DocumentTabs() }
+        #endif
+        // Outermost, so the items belong to the document's own toolbar.
+        .toolbar { toolbarContent }
+    }
+
+    /// The drawing sheet with its tool palette.
+    private var sheet: some View {
         SchematicCanvas(editor: editor)
             .onGeometryChange(for: CGSize.self) { $0.size } action: { canvasSize = $0 }
             .ignoresSafeArea(edges: .bottom)
@@ -32,36 +100,6 @@ struct ContentView: View {
             }
             // The palette tells the sheet where it is, in the sheet's coordinates.
             .coordinateSpace(.named(ToolPalette.sheetSpace))
-            #if os(iOS)
-            .toolbarTitleDisplayMode(.inline)
-            #endif
-            .inspector(isPresented: $showInspector) {
-                InspectorView(editor: editor)
-            }
-            .sheet(isPresented: $showMapleExport) {
-                // Without what lies in excluded areas.
-                MapleExportView(circuit: editor.calculationCircuit)
-            }
-            .sheet(isPresented: $showSettings) {
-                NavigationStack {
-                    SettingsView()
-                        .toolbar {
-                            ToolbarItem(placement: .confirmationAction) {
-                                Button("Færdig") { showSettings = false }
-                            }
-                        }
-                }
-            }
-            // The document detects unsaved changes (and autosaves) through
-            // the undo actions the editor registers here.
-            .onAppear { editor.undoManager = undoManager }
-            .onChange(of: undoManager) { editor.undoManager = undoManager }
-            #if os(macOS)
-            // Open documents share one window as tabs.
-            .background { DocumentTabs() }
-            #endif
-            // Outermost, so the items belong to the document's own toolbar.
-            .toolbar { toolbarContent }
     }
 
     private var canvasCenter: CGPoint {
@@ -104,7 +142,7 @@ struct ContentView: View {
 
         ToolbarItem {
             Button("Maple-output", systemImage: "function") {
-                showMapleExport = true
+                showMapleExport.toggle()
             }
             // Only offered once everything unknown on the sheet can be computed.
             .disabled(!editor.solution.isComplete)

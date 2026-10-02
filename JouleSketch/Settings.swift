@@ -11,6 +11,8 @@ enum SettingsKey {
     static let pageHeight = "pageHeight"
     /// Hides the computed values so the user can work them out themselves.
     static let studyMode = "studyMode"
+    /// Shows the walkthrough in a panel beside the sheet instead of a window over it.
+    static let walkthroughSideBySide = "walkthroughSideBySide"
 }
 
 // MARK: - Background

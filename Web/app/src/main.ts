@@ -48,6 +48,7 @@ interface JouleApp {
   groups(): string;
   walkthrough(method: string, groupID: string): string;
   mapleMathML(code: string): string;
+  toolIcon(id: string, active: boolean): string;
 }
 
 interface TextLine { id: string; text: string; isMath: boolean }
@@ -77,9 +78,11 @@ interface Settings {
   pageWidth: number;
   pageHeight: number;
   keyBindings: string;
+  /** The walkthrough in a panel beside the sheet instead of a window over it. */
+  walkSideBySide: boolean;
 }
 
-const defaultSettings: Settings = { resistorStyle: "iec", showGrid: true, studyMode: false, pageWidth: 100, pageHeight: 100, keyBindings: "" };
+const defaultSettings: Settings = { resistorStyle: "iec", showGrid: true, studyMode: false, pageWidth: 100, pageHeight: 100, keyBindings: "", walkSideBySide: false };
 
 function loadSettings(): Settings {
   try {
@@ -101,28 +104,29 @@ function saveSettings() {
 
 const SHEET_COLOR = "rgb(244, 243, 239)";
 
-const TOOLS: { id: string; name: string; action?: string; icon: string }[] = [
-  { id: "select", name: "Vælg", action: "select", icon: "↖" },
-  { id: "wire", name: "Ledning", action: "wire", icon: "╱" },
-  { id: "resistor", name: "Modstand", action: "resistor", icon: "▭" },
-  { id: "voltageSource", name: "Spændingskilde", action: "voltageSource", icon: "⊕" },
-  { id: "currentSource", name: "Strømkilde", action: "currentSource", icon: "⇥" },
-  { id: "vcvs", name: "Spændingsstyret spændingskilde", icon: "◇+" },
-  { id: "ccvs", name: "Strømstyret spændingskilde", icon: "◇±" },
-  { id: "vccs", name: "Spændingsstyret strømkilde", icon: "◇→" },
-  { id: "cccs", name: "Strømstyret strømkilde", icon: "◇⇉" },
-  { id: "diode", name: "Diode", action: "diode", icon: "▷|" },
-  { id: "led", name: "Lysdiode (LED)", action: "led", icon: "▷|↗" },
-  { id: "ground", name: "Stel (0 V)", action: "ground", icon: "⏚" },
-  { id: "current", name: "Strøm i ledning", action: "current", icon: "➤" },
-  { id: "probe", name: "Spændingspunkt", action: "probe", icon: "●" },
-  { id: "power", name: "Effekt i komponent", action: "power", icon: "◯" },
-  { id: "equivalent", name: "Samlet modstand (Req)", action: "equivalent", icon: "Rₑ" },
-  { id: "text", name: "Tekst og udregning", action: "text", icon: "T" },
-  { id: "mesh", name: "Maskestrøm", action: "mesh", icon: "↻" },
-  { id: "groupArea", name: "Gruppe", action: "groupArea", icon: "▢" },
-  { id: "pen", name: "Pen", icon: "✎" },
-  { id: "eraser", name: "Viskelæder", icon: "⌫" },
+// Icons are drawn by the shared Swift code (ToolIconScene), like the Mac palette.
+const TOOLS: { id: string; name: string; action?: string }[] = [
+  { id: "select", name: "Vælg", action: "select" },
+  { id: "wire", name: "Ledning", action: "wire" },
+  { id: "resistor", name: "Modstand", action: "resistor" },
+  { id: "voltageSource", name: "Spændingskilde", action: "voltageSource" },
+  { id: "currentSource", name: "Strømkilde", action: "currentSource" },
+  { id: "vcvs", name: "Spændingsstyret spændingskilde" },
+  { id: "ccvs", name: "Strømstyret spændingskilde" },
+  { id: "vccs", name: "Spændingsstyret strømkilde" },
+  { id: "cccs", name: "Strømstyret strømkilde" },
+  { id: "diode", name: "Diode", action: "diode" },
+  { id: "led", name: "Lysdiode (LED)", action: "led" },
+  { id: "ground", name: "Stel (0 V)", action: "ground" },
+  { id: "current", name: "Strøm i ledning", action: "current" },
+  { id: "probe", name: "Spændingspunkt", action: "probe" },
+  { id: "power", name: "Effekt i komponent", action: "power" },
+  { id: "equivalent", name: "Samlet modstand (Req)", action: "equivalent" },
+  { id: "text", name: "Tekst og udregning", action: "text" },
+  { id: "mesh", name: "Maskestrøm", action: "mesh" },
+  { id: "groupArea", name: "Gruppe", action: "groupArea" },
+  { id: "pen", name: "Pen" },
+  { id: "eraser", name: "Viskelæder" },
 ];
 
 document.body.innerHTML = `
@@ -158,6 +162,7 @@ document.body.innerHTML = `
       <div id="textLayer"></div>
       <div id="toolOptions"></div>
     </div>
+    <aside id="walkPanel" hidden></aside>
   </main>
   <div id="popover" hidden></div>
   <dialog id="dialog"><div id="dialogBody"></div></dialog>
@@ -173,6 +178,7 @@ const dialog = document.getElementById("dialog") as HTMLDialogElement;
 const dialogBody = document.getElementById("dialogBody")!;
 const palette = document.getElementById("palette")!;
 const toolOptions = document.getElementById("toolOptions")!;
+const walkPanel = document.getElementById("walkPanel")!;
 
 // MARK: - Starting the Swift part
 
@@ -229,6 +235,7 @@ function changed() {
 
 let autosaveTimer = 0;
 function scheduleAutosave() {
+  scheduleWalkRefresh();
   clearTimeout(autosaveTimer);
   autosaveTimer = window.setTimeout(() => {
     localStorage.setItem("autosave", app.save());
@@ -253,7 +260,7 @@ function buildPalette() {
     button.dataset.tool = tool.id;
     const key = keyFor(tool.action);
     button.title = key ? `${tool.name} (${key})` : tool.name;
-    button.innerHTML = `<span class="icon">${tool.icon}</span><span class="label">${tool.name}</span>${key ? `<kbd>${key}</kbd>` : ""}`;
+    button.innerHTML = `<canvas class="icon"></canvas><span class="label">${tool.name}</span>${key ? `<kbd>${key}</kbd>` : ""}`;
     button.addEventListener("click", () => {
       app.setToolID(tool.id);
       redraw();
@@ -261,13 +268,38 @@ function buildPalette() {
     });
     palette.appendChild(button);
   }
+  iconsDrawnFor = "";
 }
+
+/** What the icons were last drawn for: the picked tool and resistor style. */
+let iconsDrawnFor = "";
+
+/** Draws the palette's icons with the shared Swift code, the picked one in white. */
+function drawToolIcons() {
+  const key = `${state.tool} ${settings.resistorStyle}`;
+  if (iconsDrawnFor === key) return;
+  iconsDrawnFor = key;
+  const ratio = window.devicePixelRatio || 1;
+  for (const button of palette.querySelectorAll<HTMLButtonElement>("button")) {
+    const icon = button.querySelector<HTMLCanvasElement>("canvas.icon");
+    const id = button.dataset.tool;
+    if (!icon || !id) continue;
+    icon.width = Math.round(30 * ratio);
+    icon.height = Math.round(24 * ratio);
+    const iconContext = icon.getContext("2d")!;
+    iconContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+    iconContext.clearRect(0, 0, 30, 24);
+    paint(iconContext, app.toolIcon(id, id === state.tool), "transparent", 30, 24);
+  }
+}
+
 buildPalette();
 
 function updateChrome() {
   for (const button of palette.querySelectorAll<HTMLButtonElement>("button")) {
     button.classList.toggle("active", button.dataset.tool === state.tool);
   }
+  drawToolIcons();
   (document.querySelector('[data-cmd="undo"]') as HTMLButtonElement).disabled = !state.canUndo;
   (document.querySelector('[data-cmd="redo"]') as HTMLButtonElement).disabled = !state.canRedo;
   (document.querySelector('[data-cmd="delete"]') as HTMLButtonElement).disabled = !state.hasSelection;
@@ -336,7 +368,10 @@ function runCommand(name: string) {
     case "zoomOut": app.zoomAroundCenter(0.8); break;
     case "zoomReset": app.resetView(); break;
     case "report": showReport(); return;
-    case "walkthrough": showWalkthrough(); return;
+    case "walkthrough":
+      if (walkPanel.hidden) showWalkthrough();
+      else closeWalkPanel();
+      return;
     case "settings": showSettings(); return;
     default:
       app.command(name);
@@ -783,9 +818,27 @@ function showWalkthrough() {
   const maple = walk.maple
     ? `<h3>Maple</h3><div class="buttons left"><button data-copy="maple">Kopiér til Maple (2-D)</button><button data-copy="text">Kopiér som tekst</button></div><pre id="mapleCode">${escapeHTML(walk.maple)}</pre>`
     : "";
-  showDialog(header + body + maple);
+  const layout = settings.walkSideBySide
+    ? `<button data-layout title="Vis gennemgangen i et vindue over diagrammet">Vis som vindue</button><button data-walk-close title="Luk gennemgangen">✕</button>`
+    : `<button data-layout title="Vis gennemgangen ved siden af diagrammet">Vis side om side</button>`;
+  const html = `<div class="walkLayout">${layout}</div>` + header + body + maple;
+  const container = settings.walkSideBySide ? walkPanel : dialogBody;
+  if (settings.walkSideBySide) {
+    // Refreshing keeps the place in the walkthrough.
+    const scroll = walkPanel.scrollTop;
+    walkPanel.innerHTML = html;
+    if (walkPanel.hidden) {
+      walkPanel.hidden = false;
+      if (dialog.open) dialog.close();
+    } else {
+      walkPanel.scrollTop = scroll;
+    }
+  } else {
+    closeWalkPanel();
+    showDialog(html);
+  }
 
-  const sections = document.getElementById("walkSections");
+  const sections = container.querySelector("#walkSections");
   for (const section of walk.sections ?? []) {
     const element = document.createElement("section");
     element.innerHTML = `<h3>${escapeHTML(section.title)}</h3>`;
@@ -799,22 +852,44 @@ function showWalkthrough() {
     sections?.appendChild(element);
   }
 
-  dialogBody.querySelectorAll<HTMLButtonElement>("[data-method]").forEach((button) =>
+  container.querySelectorAll<HTMLButtonElement>("[data-method]").forEach((button) =>
     button.addEventListener("click", () => {
       walkMethod = button.dataset.method!;
       showWalkthrough();
     }));
-  document.getElementById("walkGroup")?.addEventListener("change", (event) => {
+  container.querySelector("#walkGroup")?.addEventListener("change", (event) => {
     walkGroup = (event.target as HTMLSelectElement).value;
     showWalkthrough();
   });
-  dialogBody.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) =>
+  container.querySelector("[data-layout]")?.addEventListener("click", () => {
+    settings.walkSideBySide = !settings.walkSideBySide;
+    saveSettings();
+    showWalkthrough();
+  });
+  container.querySelector("[data-walk-close]")?.addEventListener("click", closeWalkPanel);
+  container.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) =>
     button.addEventListener("click", async () => {
       if (!walk.maple) return;
       const text = button.dataset.copy === "maple" ? app.mapleMathML(walk.maple) : walk.maple;
       await navigator.clipboard.writeText(text);
       button.textContent = "✓ Kopieret";
     }));
+}
+
+function closeWalkPanel() {
+  if (walkPanel.hidden) return;
+  walkPanel.hidden = true;
+  walkPanel.innerHTML = "";
+}
+
+let walkRefreshTimer = 0;
+/** The panel follows the drawing as it is edited, once the editing pauses. */
+function scheduleWalkRefresh() {
+  if (walkPanel.hidden) return;
+  clearTimeout(walkRefreshTimer);
+  walkRefreshTimer = window.setTimeout(() => {
+    if (!walkPanel.hidden) showWalkthrough();
+  }, 300);
 }
 
 function showSettings() {

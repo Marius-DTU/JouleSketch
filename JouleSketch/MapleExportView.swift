@@ -6,12 +6,22 @@ import SwiftUI
 struct MapleExportView: View {
     /// The whole document; `circuit` is what's worked with.
     let document: Circuit
+    /// Shown in a panel beside the sheet rather than in a window over it.
+    let isDocked: Bool
+    /// Closes the panel when docked; the window closes itself.
+    let onClose: () -> Void
 
-    init(circuit: Circuit) {
+    init(circuit: Circuit, isDocked: Bool = false, onClose: @escaping () -> Void = {}) {
         document = circuit
+        self.isDocked = isDocked
+        self.onClose = onClose
     }
 
     @Environment(\.dismiss) private var dismiss
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    #endif
+    @AppStorage(SettingsKey.walkthroughSideBySide) private var sideBySide = false
     /// Which copy button was used last, for its checkmark.
     @State private var copied: CopyKind?
 
@@ -54,80 +64,161 @@ struct MapleExportView: View {
         let results = results
         let shown = method ?? WalkMethod.allCases.first { if case .steps = results[$0] { true } else { false } } ?? .nodal
         let code = maple(shown, results[shown])
-        NavigationStack {
+        if isDocked {
             VStack(spacing: 0) {
-                Picker("Metode", selection: Binding(get: { shown }, set: { method = $0; copied = nil })) {
-                    ForEach(WalkMethod.allCases) { option in
-                        Text(isAvailable(option, results) ? option.title : "\(option.title) (ikke mulig)").tag(option)
-                    }
+                HStack {
+                    Text("Gennemgang – \(shown.title.lowercased())")
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer()
+                    layoutButton
+                    Button("Luk", systemImage: "xmark") { onClose() }
+                        .labelStyle(.iconOnly)
+                        .help("Luk gennemgangen")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding([.horizontal, .top])
+                .buttonStyle(.borderless)
+                .padding(.horizontal)
+                .padding(.top, 10)
 
-                if !document.groupAreas.isEmpty {
-                    Picker("Gruppe", selection: Binding(get: { groupID }, set: { groupID = $0; copied = nil })) {
-                        Text("Hele dokumentet").tag(UUID?.none)
-                        Divider()
-                        ForEach(document.groupAreas) { group in
-                            Text(group.name.isEmpty ? "Unavngiven gruppe" : group.name).tag(UUID?.some(group.id))
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .fixedSize()
-                    .padding(.top, 8)
-                }
-
-                Spacer().frame(height: 16)
-
-                Divider()
-
-                if let result = results[shown] {
-                    WalkthroughView(method: shown, result: result)
-                        .safeAreaInset(edge: .bottom) {
-                            if code != nil {
-                                #if !os(iOS)
-                                Text("Kopiér til Maple og indsæt i en Maple-worksheet: beregningen kommer ind som 2-D Math med sænkede navne og brøker. Tryk Enter for at regne. Kopiér som tekst giver almindelig Maple-input med kommentarer.")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                                    .padding()
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(.bar)
-                                #endif
-                            }
-                        }
-                }
-            }
-            .navigationTitle("Gennemgang – \(shown.title.lowercased())")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Luk") { dismiss() }
-                }
-                // Maple is on the Mac; on iOS only the walkthrough is shown.
                 #if !os(iOS)
                 if let code {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button(copied == .text ? "Kopieret" : "Kopiér som tekst", systemImage: copied == .text ? "checkmark" : "doc.plaintext") {
-                            copyToClipboard(code)
-                            copied = .text
-                        }
-                        .help("Almindelig tekst (Maple-input), fx til en teksteditor")
+                    HStack {
+                        copyButtons(code)
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button(copied == .maple ? "Kopieret" : "Kopiér til Maple", systemImage: copied == .maple ? "checkmark" : "doc.on.doc") {
-                            copyToClipboard(MapleMathML.convert(code))
-                            copied = .maple
-                        }
-                        .help("Som 2-D Math, så sænkede navne og brøker står pænt i Maple")
-                    }
+                    .controlSize(.small)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 #endif
+
+                content(shown: shown, results: results, code: code)
+            }
+            .background(.background)
+        } else {
+            NavigationStack {
+                content(shown: shown, results: results, code: code)
+                    .navigationTitle("Gennemgang – \(shown.title.lowercased())")
+                    #if os(iOS)
+                    .navigationBarTitleDisplayMode(.inline)
+                    #endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Luk") { dismiss() }
+                        }
+                        if canDock {
+                            ToolbarItem {
+                                layoutButton
+                            }
+                        }
+                        // Maple is on the Mac; on iOS only the walkthrough is shown.
+                        #if !os(iOS)
+                        if let code {
+                            ToolbarItemGroup(placement: .confirmationAction) {
+                                copyButtons(code)
+                            }
+                        }
+                        #endif
+                    }
+            }
+            .frame(minWidth: 620, idealWidth: 720, minHeight: min(560, maxSheetHeight), idealHeight: min(720, maxSheetHeight), maxHeight: maxSheetHeight)
+        }
+    }
+
+    /// Whether there is room for the panel beside the sheet (not on an iPhone).
+    private var canDock: Bool {
+        #if os(iOS)
+        sizeClass != .compact
+        #else
+        true
+        #endif
+    }
+
+    /// Switches between a window over the sheet and a panel beside it.
+    private var layoutButton: some View {
+        Button(isDocked ? "Vis som vindue" : "Vis side om side",
+               systemImage: isDocked ? "macwindow" : "rectangle.split.2x1") {
+            sideBySide = !isDocked
+        }
+        .help(isDocked ? "Vis gennemgangen i et vindue over diagrammet" : "Vis gennemgangen ved siden af diagrammet")
+    }
+
+    #if !os(iOS)
+    @ViewBuilder
+    private func copyButtons(_ code: String) -> some View {
+        Button(copied == .text ? "Kopieret" : "Kopiér som tekst", systemImage: copied == .text ? "checkmark" : "doc.plaintext") {
+            copyToClipboard(code)
+            copied = .text
+        }
+        .help("Almindelig tekst (Maple-input), fx til en teksteditor")
+        Button(copied == .maple ? "Kopieret" : "Kopiér til Maple", systemImage: copied == .maple ? "checkmark" : "doc.on.doc") {
+            copyToClipboard(MapleMathML.convert(code))
+            copied = .maple
+        }
+        .help("Som 2-D Math, så sænkede navne og brøker står pænt i Maple")
+    }
+    #endif
+
+    /// The method and group pickers and the walkthrough itself.
+    private func content(shown: WalkMethod, results: [WalkMethod: WalkResult], code: String?) -> some View {
+        VStack(spacing: 0) {
+            Picker("Metode", selection: Binding(get: { shown }, set: { method = $0; copied = nil })) {
+                ForEach(WalkMethod.allCases) { option in
+                    // The panel is too narrow for the note; the walkthrough
+                    // itself says when a method can't be used.
+                    Text(isAvailable(option, results) || isDocked ? option.title : "\(option.title) (ikke mulig)").tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding([.horizontal, .top])
+
+            if !document.groupAreas.isEmpty {
+                Picker("Gruppe", selection: Binding(get: { groupID }, set: { groupID = $0; copied = nil })) {
+                    Text("Hele dokumentet").tag(UUID?.none)
+                    Divider()
+                    ForEach(document.groupAreas) { group in
+                        Text(group.name.isEmpty ? "Unavngiven gruppe" : group.name).tag(UUID?.some(group.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                .padding(.top, 8)
+            }
+
+            Spacer().frame(height: 16)
+
+            Divider()
+
+            if let result = results[shown] {
+                WalkthroughView(method: shown, result: result)
+                    .safeAreaInset(edge: .bottom) {
+                        if code != nil {
+                            #if !os(iOS)
+                            Text("Kopiér til Maple og indsæt i en Maple-worksheet: beregningen kommer ind som 2-D Math med sænkede navne og brøker. Tryk Enter for at regne. Kopiér som tekst giver almindelig Maple-input med kommentarer.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(.bar)
+                            #endif
+                        }
+                    }
             }
         }
-        .frame(minWidth: 620, minHeight: 560)
+    }
+
+    /// The tallest the sheet can be without reaching under the Dock. On the
+    /// Mac a sheet otherwise grows to its content's ideal height, which for a
+    /// long walkthrough is taller than the screen. It hangs below the window's
+    /// title bar, tab bar and toolbar, so room is left for those.
+    private var maxSheetHeight: CGFloat {
+        #if os(macOS)
+        guard let visible = (NSApp.keyWindow?.screen ?? NSScreen.main)?.visibleFrame else { return .infinity }
+        return max(320, visible.height - 120)
+        #else
+        return .infinity
+        #endif
     }
 
     private func copyToClipboard(_ text: String) {

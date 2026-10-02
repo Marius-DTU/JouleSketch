@@ -66,11 +66,18 @@ Første gang på serveren:
 1. Lav en adgangsnøgle på GitHub: **Settings → Developer settings → Personal
    access tokens → Tokens (classic) → Generate new token**. Kryds kun
    `read:packages` af.
-2. Kopiér `deploy/docker-compose.yml` til serveren og kør:
-   ```sh
-   docker login ghcr.io -u Marius-DTU    # adgangskode: nøglen fra trin 1
-   docker compose up -d
+2. Kopiér `deploy/docker-compose.yml` til serveren (eller ind i en ny stak i
+   Dockge), og læg nøglen i stakkens `.env`, så Watchtower kan logge ind:
    ```
+   GHCR_USER=Marius-DTU
+   GHCR_TOKEN=nøglen fra trin 1
+   ```
+3. Log Docker ind én gang, så det første hent virker. Med Dockge skal det
+   ske inde i Dockge-containeren, da det er den, der henter billederne:
+   ```sh
+   docker exec -it dockge docker login ghcr.io -u Marius-DTU   # adgangskode: nøglen
+   ```
+   Uden Dockge: `docker login ghcr.io -u Marius-DTU` og `docker compose up -d`.
 
 ## Filer
 
