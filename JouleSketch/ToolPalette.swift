@@ -8,9 +8,8 @@ struct ToolPalette: View {
     let availableWidth: CGFloat
 
     @AppStorage(SettingsKey.keyBindings) private var keyBindingsStorage = ""
-    /// The controlled source last picked from the menu, shown on its button.
-    @State private var lastDependent = ComponentKind.vcvs
-    @State private var showDependentSources = false
+    /// The group whose menu is open.
+    @State private var openGroup: ToolGroup?
     /// The buttons' size at full scale.
     @State private var naturalSize: CGSize = .zero
     /// Where the palette is scrolled to when it doesn't fit, and where a
@@ -84,72 +83,23 @@ struct ToolPalette: View {
 
     private var toolButtons: some View {
         HStack(spacing: 4) {
-            ForEach(Tool.allCases.filter { !$0.isDependentSource }) { tool in
-                toolButton(tool)
-                // The four controlled sources share one button with a menu.
-                if tool == .component(.currentSource) {
-                    dependentSourceMenu
-                }
+            ForEach(ToolGroup.allCases) { group in
+                groupButton(group)
             }
         }
     }
 
-    private var dependentSourceMenu: some View {
-        let activeKind: ComponentKind? = if case .component(let kind) = editor.tool, kind.isDependent { kind } else { nil }
-        let shownKind = activeKind ?? lastDependent
-        let isActive = activeKind != nil
-        return Button {
-            showDependentSources.toggle()
-        } label: {
-            ToolIcon(tool: .component(shownKind), color: isActive ? .white : .primary)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 8)
-                .background {
-                    if isActive {
-                        Capsule().fill(Color.accentColor)
-                    }
-                }
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help("Styrede kilder")
-        .accessibilityLabel("Styrede kilder")
-        .accessibilityValue(shownKind.displayName)
-        // Opens upwards, above the palette.
-        .popover(isPresented: $showDependentSources, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(ComponentKind.dependentSources) { kind in
-                    Button {
-                        lastDependent = kind
-                        editor.tool = .component(kind)
-                        showDependentSources = false
-                    } label: {
-                        HStack(spacing: 10) {
-                            ToolIcon(tool: .component(kind), color: editor.tool == .component(kind) ? .accentColor : .primary)
-                            Text(kind.isVoltageControlled ? "Spændingsstyret" : "Strømstyret")
-                            Spacer(minLength: 0)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help(kind.displayName)
-                    .accessibilityLabel(kind.displayName)
-                }
-            }
-            .padding(8)
-            .frame(minWidth: 190)
-            .presentationCompactAdaptation(.popover)
-        }
-    }
-
-    private func toolButton(_ tool: Tool) -> some View {
+    /// A palette button. For a group with several tools it shows the one last
+    /// used; clicking it again while it's picked opens the menu with the rest.
+    private func groupButton(_ group: ToolGroup) -> some View {
+        let tool = editor.shownTool(in: group)
         let isActive = editor.tool == tool
         return Button {
-            editor.tool = tool
-            // ⌘-clicking the voltage point tool places voltage drops instead.
-            if tool == .probe { editor.placesVoltageDrops = Self.isCommandHeld }
+            if group.hasMenu, isActive {
+                openGroup = group
+            } else {
+                pick(tool)
+            }
         } label: {
             ToolIcon(tool: tool, color: isActive ? .white : .primary)
                 .padding(.horizontal, 7)
@@ -167,12 +117,72 @@ struct ToolPalette: View {
                             .padding(.trailing, 3)
                     }
                 }
+                // A small corner mark shows that there's a menu.
+                .overlay(alignment: .bottomTrailing) {
+                    if group.hasMenu {
+                        Image(systemName: "arrowtriangle.down.fill")
+                            .font(.system(size: 5))
+                            .foregroundStyle(isActive ? .white : .secondary)
+                            .padding(.trailing, 4)
+                            .padding(.bottom, 4)
+                    }
+                }
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(helpText(for: tool))
-        .accessibilityLabel(tool.displayName)
+        .help(group.hasMenu ? "\(helpText(for: tool)) · klik igen for \(group.title.lowercased())" : helpText(for: tool))
+        .accessibilityLabel(group.hasMenu ? group.title : tool.displayName)
+        .accessibilityValue(group.hasMenu ? tool.displayName : "")
         .accessibilityAddTraits(isActive ? .isSelected : [])
+        .contextMenu {
+            if group.hasMenu {
+                ForEach(group.tools) { item in
+                    Button(item.displayName) { pick(item) }
+                }
+            }
+        }
+        // Opens upwards, above the palette.
+        .popover(isPresented: Binding(
+            get: { openGroup == group },
+            set: { if !$0, openGroup == group { openGroup = nil } }
+        ), arrowEdge: .bottom) {
+            groupMenu(group)
+        }
+    }
+
+    /// The tools of a group, with icon and name.
+    private func groupMenu(_ group: ToolGroup) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(group.tools) { tool in
+                Button {
+                    pick(tool)
+                    openGroup = nil
+                } label: {
+                    HStack(spacing: 10) {
+                        ToolIcon(tool: tool, color: editor.tool == tool ? .accentColor : .primary)
+                        Text(tool.displayName)
+                        Spacer(minLength: 12)
+                        Text(tool.key(in: KeyBindings(storageString: keyBindingsStorage)).uppercased())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(helpText(for: tool))
+                .accessibilityLabel(tool.displayName)
+            }
+        }
+        .padding(8)
+        .frame(minWidth: 240)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    private func pick(_ tool: Tool) {
+        editor.tool = tool
+        // ⌘-clicking the voltage point tool places voltage drops instead.
+        if tool == .probe { editor.placesVoltageDrops = Self.isCommandHeld }
     }
 
     /// Whether ⌘ is held right now (Mac only).

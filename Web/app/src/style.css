@@ -91,6 +91,40 @@ main {
 #palette kbd { font: inherit; font-size: 11px; color: var(--muted); }
 #palette button.active kbd { color: white; }
 
+/* The mark on buttons that open a menu with more tools. */
+#palette .more { font-size: 10px; color: var(--muted); }
+#palette button.active .more { color: white; }
+
+/* The menu with a palette group's tools. */
+#toolMenu {
+  position: fixed;
+  z-index: 20;
+  min-width: 260px;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#toolMenu[hidden] { display: none; }
+#toolMenu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 5px 8px;
+}
+#toolMenu button:hover { background: rgba(0, 0, 0, 0.05); }
+#toolMenu button.active { color: var(--accent); font-weight: 600; }
+#toolMenu .icon { width: 30px; height: 24px; flex: none; }
+#toolMenu .label { flex: 1; white-space: nowrap; }
+#toolMenu kbd { font: inherit; font-size: 11px; color: var(--muted); }
+
 #sheet {
   flex: 1;
   position: relative;

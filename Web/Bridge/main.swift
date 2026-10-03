@@ -180,6 +180,22 @@ import JavaScriptKit
         }
     }
 
+    /// The palette's buttons in order, as JSON `[{id, title, shown, tools: [id]}]`,
+    /// where `shown` is the tool the button shows and picks.
+    @JS func toolGroups() -> String {
+        let json = JSONWriter()
+        json.array(ToolGroup.allCases) { group in
+            json.object {
+                json.field("id", group.id)
+                json.field("title", group.title)
+                json.field("shown", editor.shownTool(in: group).id)
+                json.key("tools")
+                json.array(group.tools) { json.value($0.id) }
+            }
+        }
+        return json.text
+    }
+
     private func setTool(_ tool: Tool) {
         editor.isDrawing = false
         editor.tool = tool

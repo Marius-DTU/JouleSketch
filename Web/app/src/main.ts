@@ -49,6 +49,7 @@ interface JouleApp {
   walkthrough(method: string, groupID: string): string;
   mapleMathML(code: string): string;
   toolIcon(id: string, active: boolean): string;
+  toolGroups(): string;
 }
 
 interface TextLine { id: string; text: string; isMath: boolean }
@@ -253,52 +254,144 @@ function keyFor(action: string | undefined): string {
   return binding?.key.toUpperCase() ?? "";
 }
 
+interface ToolGroupInfo { id: string; title: string; shown: string; tools: string[] }
+
+/** The pen or eraser, whichever was used last. */
+let lastDrawTool = "pen";
+
+/**
+ * The palette's buttons, from the shared Swift code (ToolGroup) like the Mac
+ * palette: tools that belong together share a button showing the one last
+ * used. Pen and eraser are only tools on the web, so they get their own.
+ */
+function toolGroupList(): ToolGroupInfo[] {
+  const groups = JSON.parse(app.toolGroups()) as ToolGroupInfo[];
+  if (state.tool === "pen" || state.tool === "eraser") lastDrawTool = state.tool;
+  groups.push({ id: "drawing", title: "Tegning", shown: lastDrawTool, tools: ["pen", "eraser"] });
+  return groups;
+}
+
+function toolInfo(id: string) {
+  return TOOLS.find((t) => t.id === id) ?? { id, name: id };
+}
+
 function buildPalette() {
   palette.innerHTML = "";
-  for (const tool of TOOLS) {
+  for (const group of toolGroupList()) {
     const button = document.createElement("button");
-    button.dataset.tool = tool.id;
-    const key = keyFor(tool.action);
-    button.title = key ? `${tool.name} (${key})` : tool.name;
-    button.innerHTML = `<canvas class="icon"></canvas><span class="label">${tool.name}</span>${key ? `<kbd>${key}</kbd>` : ""}`;
+    button.dataset.group = group.id;
+    button.innerHTML = `<canvas class="icon"></canvas><span class="label"></span><kbd></kbd>${group.tools.length > 1 ? `<span class="more">▸</span>` : ""}`;
     button.addEventListener("click", () => {
-      app.setToolID(tool.id);
-      redraw();
-      canvas.focus();
+      const current = toolGroupList().find((g) => g.id === group.id);
+      if (!current) return;
+      // Clicking the picked button again opens the menu with the group's tools.
+      if (current.tools.length > 1 && current.shown === state.tool) {
+        openToolMenu(button, current);
+        return;
+      }
+      pickTool(current.shown);
     });
     palette.appendChild(button);
   }
   iconsDrawnFor = "";
+  updatePalette();
 }
 
-/** What the icons were last drawn for: the picked tool and resistor style. */
+function pickTool(id: string) {
+  closeToolMenu();
+  app.setToolID(id);
+  redraw();
+  canvas.focus();
+}
+
+/** Shows each button's tool: its icon, name and key, and whether it's picked. */
+function updatePalette() {
+  for (const group of toolGroupList()) {
+    const button = palette.querySelector<HTMLButtonElement>(`button[data-group="${group.id}"]`);
+    if (!button) continue;
+    const tool = toolInfo(group.shown);
+    const key = keyFor(tool.action);
+    if (button.dataset.tool !== tool.id) {
+      button.dataset.tool = tool.id;
+      button.querySelector(".label")!.textContent = tool.name;
+      button.querySelector("kbd")!.textContent = key;
+      const more = group.tools.length > 1 ? ` · klik igen for ${group.title.toLowerCase()}` : "";
+      button.title = (key ? `${tool.name} (${key})` : tool.name) + more;
+    }
+    button.classList.toggle("active", tool.id === state.tool);
+  }
+}
+
+const toolMenu = document.createElement("div");
+toolMenu.id = "toolMenu";
+toolMenu.hidden = true;
+document.body.appendChild(toolMenu);
+
+/** A menu next to a palette button with all the tools of its group. */
+function openToolMenu(button: HTMLElement, group: ToolGroupInfo) {
+  toolMenu.innerHTML = "";
+  for (const id of group.tools) {
+    const tool = toolInfo(id);
+    const key = keyFor(tool.action);
+    const item = document.createElement("button");
+    item.classList.toggle("active", id === state.tool);
+    item.innerHTML = `<canvas class="icon"></canvas><span class="label">${tool.name}</span><kbd>${key}</kbd>`;
+    item.addEventListener("click", () => pickTool(id));
+    toolMenu.appendChild(item);
+    drawIcon(item.querySelector("canvas")!, id, false);
+  }
+  const rect = button.getBoundingClientRect();
+  toolMenu.style.left = `${rect.right + 4}px`;
+  toolMenu.style.top = `${rect.top}px`;
+  toolMenu.hidden = false;
+  // Keep it on the screen.
+  const overflow = toolMenu.getBoundingClientRect().bottom - (window.innerHeight - 8);
+  if (overflow > 0) toolMenu.style.top = `${Math.max(8, rect.top - overflow)}px`;
+}
+
+function closeToolMenu() {
+  toolMenu.hidden = true;
+}
+
+document.addEventListener("pointerdown", (event) => {
+  const target = event.target as Node;
+  if (!toolMenu.hidden && !toolMenu.contains(target) && !palette.contains(target)) closeToolMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !toolMenu.hidden) closeToolMenu();
+});
+
+/** What the icons were last drawn for: the picked tool, shown tools and resistor style. */
 let iconsDrawnFor = "";
+
+function drawIcon(icon: HTMLCanvasElement, id: string, active: boolean) {
+  const ratio = window.devicePixelRatio || 1;
+  icon.width = Math.round(30 * ratio);
+  icon.height = Math.round(24 * ratio);
+  const iconContext = icon.getContext("2d")!;
+  iconContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+  iconContext.clearRect(0, 0, 30, 24);
+  paint(iconContext, app.toolIcon(id, active), "transparent", 30, 24);
+}
 
 /** Draws the palette's icons with the shared Swift code, the picked one in white. */
 function drawToolIcons() {
-  const key = `${state.tool} ${settings.resistorStyle}`;
+  const buttons = [...palette.querySelectorAll<HTMLButtonElement>("button")];
+  const key = `${state.tool} ${settings.resistorStyle} ${buttons.map((b) => b.dataset.tool).join(",")}`;
   if (iconsDrawnFor === key) return;
   iconsDrawnFor = key;
-  const ratio = window.devicePixelRatio || 1;
-  for (const button of palette.querySelectorAll<HTMLButtonElement>("button")) {
+  for (const button of buttons) {
     const icon = button.querySelector<HTMLCanvasElement>("canvas.icon");
     const id = button.dataset.tool;
     if (!icon || !id) continue;
-    icon.width = Math.round(30 * ratio);
-    icon.height = Math.round(24 * ratio);
-    const iconContext = icon.getContext("2d")!;
-    iconContext.setTransform(ratio, 0, 0, ratio, 0, 0);
-    iconContext.clearRect(0, 0, 30, 24);
-    paint(iconContext, app.toolIcon(id, id === state.tool), "transparent", 30, 24);
+    drawIcon(icon, id, id === state.tool);
   }
 }
 
 buildPalette();
 
 function updateChrome() {
-  for (const button of palette.querySelectorAll<HTMLButtonElement>("button")) {
-    button.classList.toggle("active", button.dataset.tool === state.tool);
-  }
+  updatePalette();
   drawToolIcons();
   (document.querySelector('[data-cmd="undo"]') as HTMLButtonElement).disabled = !state.canUndo;
   (document.querySelector('[data-cmd="redo"]') as HTMLButtonElement).disabled = !state.canRedo;

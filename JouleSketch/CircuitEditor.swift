@@ -32,8 +32,9 @@ enum Tool: Hashable, CaseIterable, Identifiable {
     /// Draws a named, tinted box that groups part of the sheet for the Maple window.
     case groupArea
 
+    /// In palette order, group by group.
     static var allCases: [Tool] {
-        [.select, .wire] + ComponentKind.allCases.map { .component($0) } + [.ground, .current, .probe, .power, .mesh, .equivalent, .text, .groupArea]
+        ToolGroup.allCases.flatMap(\.tools)
     }
 
     var id: String {
@@ -52,10 +53,9 @@ enum Tool: Hashable, CaseIterable, Identifiable {
         }
     }
 
-    /// One of the controlled sources, which share a button in the palette.
-    var isDependentSource: Bool {
-        if case .component(let kind) = self { return kind.isDependent }
-        return false
+    /// The palette button the tool sits under.
+    var group: ToolGroup {
+        ToolGroup.allCases.first { $0.tools.contains(self) } ?? .select
     }
 
     var displayName: String {
@@ -73,6 +73,51 @@ enum Tool: Hashable, CaseIterable, Identifiable {
         case .groupArea: "Gruppe"
         }
     }
+}
+
+/// The palette's buttons. Tools that belong together share one button, which
+/// shows the one last used and opens a menu with the rest, so the palette
+/// doesn't fill up with icons.
+enum ToolGroup: String, CaseIterable, Identifiable {
+    case select
+    case wire
+    case resistor
+    case sources
+    case diodes
+    case ground
+    case analysis
+    case notes
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .select: "Vælg"
+        case .wire: "Ledning"
+        case .resistor: "Modstand"
+        case .sources: "Kilder"
+        case .diodes: "Dioder"
+        case .ground: "Stel"
+        case .analysis: "Mål og beregn"
+        case .notes: "Noter"
+        }
+    }
+
+    var tools: [Tool] {
+        switch self {
+        case .select: [.select]
+        case .wire: [.wire]
+        case .resistor: [.component(.resistor)]
+        case .sources: [.component(.voltageSource), .component(.currentSource)] + ComponentKind.dependentSources.map { .component($0) }
+        case .diodes: [.component(.diode), .component(.led)]
+        case .ground: [.ground]
+        case .analysis: [.probe, .current, .mesh, .power, .equivalent]
+        case .notes: [.text, .groupArea]
+        }
+    }
+
+    /// Whether the button has a menu with more than one tool.
+    var hasMenu: Bool { tools.count > 1 }
 }
 
 /// The item currently selected on the schematic.
@@ -175,7 +220,18 @@ final class CircuitEditor {
                 pendingEquivalentPoint = nil
                 placesVoltageDrops = false
             }
+            lastTools[tool.group] = tool
         }
+    }
+
+    /// The tool last used in each palette group.
+    private(set) var lastTools: [ToolGroup: Tool] = [:]
+
+    /// The tool a palette button shows and picks: the active one when it's in
+    /// the group, otherwise the one last used there.
+    func shownTool(in group: ToolGroup) -> Tool {
+        if tool.group == group { return tool }
+        return lastTools[group] ?? group.tools.first ?? .select
     }
 
     /// Point A of the Req being placed, while waiting for point B.
