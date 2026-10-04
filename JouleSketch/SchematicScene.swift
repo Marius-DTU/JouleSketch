@@ -326,7 +326,7 @@ struct SchematicScene {
             let color = editor.isSelected(.probe(probe.id)) ? theme.selection : theme.probe
             let point = screenPoint(probe.position)
             drawProbe(at: point, color: color)
-            let runs = valueLabel(name: probe.name, value: probe.value, computed: solution.probeValues[probe.id], unit: "V", color: color)
+            let runs = valueLabel(name: probe.name, value: probe.value, computed: solution.probeValues[probe.id], phase: solution.phases[probe.id], id: probe.id, unit: "V", color: color)
             text(runs, at: CGPoint(x: point.x + unit * 0.5, y: point.y - unit * 0.45), anchor: TextAnchor.bottomLeading)
         }
     }
@@ -337,7 +337,10 @@ struct SchematicScene {
         drawComponent(
             component.kind, from: a, to: b, color: color, lineWidth: max(1, 2 * scale),
             // A conducting LED is drawn lit.
-            isLit: component.kind == .led && solution.diodeConducts[component.id] == true
+            isLit: component.kind == .led && solution.diodeConducts[component.id] == true,
+            waveform: component.signalWaveform,
+            isClosed: editor.isClosed(component),
+            isNormallyClosed: component.isNormallyClosed
         )
 
         let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
@@ -357,6 +360,17 @@ struct SchematicScene {
         if component.kind.isDependent {
             value.append(TextRun(text: " · ", size: size, color: theme.label))
             value += subscriptedName(component.controlLabel, size: size, weight: 500, color: theme.label)
+        }
+        // Signal generators show their phase, duty cycle and frequency, e.g.
+        // "5 V, 10 %, 1 kHz"; a low-side output only "10 %, 1 kHz".
+        if component.isLowSideOutput, let label = component.signalLabel(valueText: "") {
+            value = [TextRun(text: label, size: size, color: theme.label)]
+        } else if let details = component.signalDetails {
+            value.append(TextRun(text: details, size: size, color: theme.label))
+        }
+        // Switches have no value, only their name.
+        if component.kind.isSwitch {
+            value = component.isNormallyClosed ? [TextRun(text: "NC", size: size, color: theme.label)] : []
         }
         if component.start.y == component.end.y {
             text(name, at: CGPoint(x: mid.x, y: mid.y - unit * 1.1), anchor: TextAnchor.bottom)
@@ -397,11 +411,7 @@ struct SchematicScene {
         let color = theme.groupColor(equivalent.colorIndex)
         let size = max(7, unit * 0.6)
         let name = subscriptedName(equivalent.name, size: size, color: color)
-        let valueText: String = if !studyMode, case .value(let resistance, _) = editor.equivalentResults[equivalent.id] {
-            SIValue.format(resistance, unit: "Ω")
-        } else {
-            SIValue.format(nil, unit: "Ω")
-        }
+        let valueText = studyMode ? SIValue.format(nil, unit: "Ω") : editor.equivalentResults[equivalent.id]?.formatted ?? SIValue.format(nil, unit: "Ω")
         let value = [TextRun(text: valueText, size: size, weight: 600, color: color)]
         let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
         if equivalent.start.y == equivalent.end.y {
@@ -415,7 +425,7 @@ struct SchematicScene {
 
     private mutating func drawCurrentArrow(_ arrow: CurrentArrow, at point: CGPoint, direction: CGPoint, color: SceneColor) {
         drawArrowhead(at: point, direction: direction, size: unit * 0.9, color: color)
-        let runs = valueLabel(name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id], unit: "A", color: color)
+        let runs = valueLabel(name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id], phase: solution.phases[arrow.id], id: arrow.id, unit: "A", color: color)
         if abs(direction.x) > abs(direction.y) {
             text(runs, at: CGPoint(x: point.x, y: point.y - unit * 0.55), anchor: TextAnchor.bottom)
         } else {
@@ -486,7 +496,10 @@ struct SchematicScene {
             let valueColor = isLabelSelected ? color : (editor.isInherited(probe.name) ? theme.inherited : color)
             runs.append(TextRun(text: " = " + SIValue.format(value, unit: "V"), size: size, weight: 600, color: valueColor))
         } else if let computed = solution.probeValues[probe.id] {
-            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: "V"), size: size, weight: 600, italic: true, color: theme.computed))
+            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: "V", phase: solution.phases[probe.id]), size: size, weight: 600, italic: true, color: theme.computed))
+        }
+        if let fundamental = solution.fundamentalText(probe.id, unit: "V") {
+            runs.append(TextRun(text: "  " + fundamental, size: size, weight: 600, italic: true, color: theme.computed))
         }
         text(runs, at: labelPoint, anchor: TextAnchor.center)
     }
@@ -601,14 +614,19 @@ struct SchematicScene {
     }
 
     /// A "Name = value" label, or just the name while the value is unknown.
-    private func valueLabel(name: String, value: Double?, computed: Double?, unit valueUnit: String, color: SceneColor) -> [TextRun] {
+    private func valueLabel(
+        name: String, value: Double?, computed: Double?, phase: Double? = nil, id: UUID? = nil, unit valueUnit: String, color: SceneColor
+    ) -> [TextRun] {
         let size = max(7, unit * 0.6)
         var runs = subscriptedName(name, size: size, weight: 500, color: color)
         if let value {
             let valueColor = editor.isInherited(name) ? theme.inherited : color
             runs.append(TextRun(text: " = " + SIValue.format(value, unit: valueUnit), size: size, color: valueColor))
         } else if let computed {
-            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: valueUnit), size: size, italic: true, color: theme.computed))
+            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: valueUnit, phase: phase), size: size, italic: true, color: theme.computed))
+        }
+        if let fundamental = id.flatMap({ solution.fundamentalText($0, unit: valueUnit) }) {
+            runs.append(TextRun(text: "  " + fundamental, size: size, italic: true, color: theme.computed))
         }
         return runs
     }
@@ -769,9 +787,15 @@ struct SchematicScene {
     }
 
     private mutating func drawComponent(
-        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false
+        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false,
+        waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
     ) {
-        paint { $0.component(kind, from: a, to: b, color: color, lineWidth: lineWidth, isLit: isLit) }
+        paint {
+            $0.component(
+                kind, from: a, to: b, color: color, lineWidth: lineWidth, isLit: isLit,
+                waveform: waveform, isClosed: isClosed, isNormallyClosed: isNormallyClosed
+            )
+        }
     }
 
     private mutating func drawArrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: SceneColor) {
@@ -826,7 +850,8 @@ nonisolated struct SymbolPainter {
     /// A two-terminal component between `a` and `b`.
     /// The symbol body is centered and 2 grid units long; leads fill the rest.
     mutating func component(
-        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false
+        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false,
+        waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
     ) {
         let length = a.distance(to: b)
         guard length > 0 else { return }
@@ -884,6 +909,74 @@ nonisolated struct SymbolPainter {
                 }
             }
 
+        case .toggleSwitch, .pushButton:
+            // Two contacts; a switch has an arm hinged at the first, raised
+            // when open, and a push button a bridge pressed down onto both.
+            let x0 = center - halfBody * 0.7, x1 = center + halfBody * 0.7
+            let dot = unit * 0.12
+            stroke([.move(p(center - halfBody, 0)), .line(p(x0 - dot, 0)), .move(p(x1 + dot, 0)), .line(p(center + halfBody, 0))], color, width: lineWidth)
+            stroke([circle(p(x0, 0), dot), circle(p(x1, 0), dot)], color, width: lineWidth)
+            if kind == .toggleSwitch {
+                let reach = x1 - x0
+                let angle = isClosed ? 0 : CGFloat.pi / 6
+                stroke([.move(p(x0, 0)), .line(p(x0 + reach * cos(angle), -reach * sin(angle)))], color, width: lineWidth)
+            } else {
+                // An NC button's bridge rests under the contacts and is pushed
+                // away downwards; an NO button's is pushed down onto them.
+                let bar: CGFloat = isNormallyClosed
+                    ? (isClosed ? dot * 1.3 : unit * 0.5)
+                    : (isClosed ? -dot * 1.3 : -unit * 0.5)
+                let top = min(bar, 0) - unit * 0.45 - (isNormallyClosed ? unit * 0.2 : 0)
+                stroke([
+                    .move(p(x0, bar)), .line(p(x1, bar)),
+                    .move(p(center, bar)), .line(p(center, top)),
+                    .move(p(center - unit * 0.25, top)), .line(p(center + unit * 0.25, top)),
+                ], color, width: lineWidth)
+            }
+
+        case .capacitor:
+            // Two plates with a gap between them.
+            let gap = halfBody * 0.22
+            let plate = unit * 0.75
+            stroke([
+                .move(p(center - halfBody, 0)), .line(p(center - gap, 0)),
+                .move(p(center + gap, 0)), .line(p(center + halfBody, 0)),
+                .move(p(center - gap, -plate)), .line(p(center - gap, plate)),
+                .move(p(center + gap, -plate)), .line(p(center + gap, plate)),
+            ], color, width: lineWidth)
+
+        case .inductor:
+            // Four half loops on one side of the line.
+            let loops = 4
+            let radius = halfBody / CGFloat(loops)
+            var path: [PathOp] = [.move(p(center - halfBody, 0))]
+            for loop in 0..<loops {
+                let middle = center - halfBody + radius * CGFloat(2 * loop + 1)
+                for step in 1...12 {
+                    let angle = CGFloat.pi * (1 - CGFloat(step) / 12)
+                    path.append(.line(p(middle + radius * cos(angle), -radius * sin(angle))))
+                }
+            }
+            stroke(path, color, width: lineWidth)
+
+        case .signalGenerator:
+            // A circle with a sine wave, and + towards the end terminal.
+            stroke([circle(p(center, 0), halfBody)], color, width: lineWidth)
+            let middle = p(center, 0)
+            // Narrower when lying down, so the wave keeps clear of the signs.
+            let width = halfBody * (abs(cosine) > abs(sine) ? 0.3 : 0.45), height = halfBody * 0.25
+            // The waveform, one period across the middle.
+            let wave = SymbolPainter.wavePoints(waveform).map { CGPoint(x: middle.x + width * $0.x, y: middle.y + height * $0.y) }
+            stroke([.move(wave[0])] + wave.dropFirst().map { .line($0) }, color, width: lineWidth)
+            let sign = halfBody * 0.14
+            let plus = p(center + halfBody * 0.68, 0)
+            let minus = p(center - halfBody * 0.68, 0)
+            stroke([
+                .move(CGPoint(x: plus.x - sign, y: plus.y)), .line(CGPoint(x: plus.x + sign, y: plus.y)),
+                .move(CGPoint(x: plus.x, y: plus.y - sign)), .line(CGPoint(x: plus.x, y: plus.y + sign)),
+                .move(CGPoint(x: minus.x - sign, y: minus.y)), .line(CGPoint(x: minus.x + sign, y: minus.y)),
+            ], color, width: max(1, lineWidth * 0.8))
+
         case .voltageSource, .currentSource, .vcvs, .ccvs, .vccs, .cccs:
             if kind.isDependent {
                 stroke([.move(p(center - halfBody, 0)), .line(p(center, -halfBody)), .line(p(center + halfBody, 0)), .line(p(center, halfBody)), .close], color, width: lineWidth)
@@ -913,6 +1006,20 @@ nonisolated struct SymbolPainter {
                     .move(p(tip - head, -head * 0.8)), .line(p(tip, 0)), .line(p(tip - head, head * 0.8)),
                 ], color, width: lineWidth)
             }
+        }
+    }
+
+    /// One period of a signal generator's waveform for its symbol, with x and
+    /// y from −1 to 1 (y down).
+    static func wavePoints(_ waveform: SignalWaveform) -> [CGPoint] {
+        switch waveform {
+        case .sine:
+            (0...24).map { step in
+                let t = CGFloat(step) / 24
+                return CGPoint(x: 2 * t - 1, y: -sin(2 * .pi * t))
+            }
+        case .square:
+            [(-1, 1), (-0.5, 1), (-0.5, -1), (0.5, -1), (0.5, 1), (1, 1)].map { CGPoint(x: $0.0, y: $0.1) }
         }
     }
 

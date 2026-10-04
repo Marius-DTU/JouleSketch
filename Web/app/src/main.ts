@@ -46,6 +46,7 @@ interface JouleApp {
   setTextBoxLines(id: string, json: string): void;
   report(): string;
   groups(): string;
+  guide(): string;
   walkthrough(method: string, groupID: string): string;
   mapleMathML(code: string): string;
   toolIcon(id: string, active: boolean): string;
@@ -109,9 +110,14 @@ const SHEET_COLOR = "rgb(244, 243, 239)";
 const TOOLS: { id: string; name: string; action?: string }[] = [
   { id: "select", name: "Vælg", action: "select" },
   { id: "wire", name: "Ledning", action: "wire" },
+  { id: "toggleSwitch", name: "Kontakt", action: "toggleSwitch" },
+  { id: "pushButton", name: "Trykknap", action: "pushButton" },
   { id: "resistor", name: "Modstand", action: "resistor" },
+  { id: "capacitor", name: "Kondensator", action: "capacitor" },
+  { id: "inductor", name: "Spole", action: "inductor" },
   { id: "voltageSource", name: "Spændingskilde", action: "voltageSource" },
   { id: "currentSource", name: "Strømkilde", action: "currentSource" },
+  { id: "signalGenerator", name: "Signalgenerator", action: "signalGenerator" },
   { id: "vcvs", name: "Spændingsstyret spændingskilde" },
   { id: "ccvs", name: "Strømstyret spændingskilde" },
   { id: "vccs", name: "Spændingsstyret strømkilde" },
@@ -154,6 +160,7 @@ document.body.innerHTML = `
     </div>
     <div class="spacer"></div>
     <span id="fileName">Uden navn</span>
+    <button data-cmd="guide" title="Sådan bruger du JouleSketch">ⓘ</button>
     <button data-cmd="settings" title="Indstillinger">⚙</button>
   </header>
   <main>
@@ -465,6 +472,7 @@ function runCommand(name: string) {
       if (walkPanel.hidden) showWalkthrough();
       else closeWalkPanel();
       return;
+    case "guide": showGuide(); return;
     case "settings": showSettings(); return;
     default:
       app.command(name);
@@ -603,6 +611,9 @@ canvas.addEventListener("pointerup", (event) => {
     if (request) openPopover(JSON.parse(request));
   } else if (event.button === 2) {
     app.rightUp();
+    // A right-click on a symbol opens its editor.
+    const request = app.takeEditRequest();
+    if (request) openPopover(JSON.parse(request));
   } else if (event.button === 1) {
     middlePan = null;
   }
@@ -678,6 +689,19 @@ interface Inspection {
   controlPlaceholder?: string;
   showsPower?: boolean;
   power?: string | null;
+  /** A switch's position. */
+  closed?: boolean;
+  /** Whether a push button is normally closed (NC). */
+  normallyClosed?: boolean;
+  /** A signal generator's frequency and phase. */
+  frequency?: string;
+  phase?: string;
+  waveform?: string;
+  /** The waveforms to pick from, from the shared Swift code (SignalWaveform). */
+  waveforms?: { id: string; name: string }[];
+  hasDutyCycle?: boolean;
+  isLowSideOutput?: boolean;
+  dutyCycle?: string;
   clockwise?: boolean;
 }
 
@@ -697,6 +721,29 @@ function openPopover(request: { item: string; x: number; y: number; width: numbe
     fields.push(`<div class="error" data-error="value"></div>`);
   }
   if (info.isDependent) fields.push(field("Styres af", "controlName", info.controlName ?? "", info.controlPlaceholder));
+  if (info.closed !== undefined) {
+    fields.push(`<label class="check"><input type="checkbox" data-field="closed" ${info.closed ? "checked" : ""}> Lukket</label>`);
+    fields.push(`<p class="hint">Klik på kontakten med Vælg-værktøjet for at åbne eller lukke den.</p>`);
+  }
+  if (info.normallyClosed !== undefined) {
+    fields.push(`<label class="check"><input type="checkbox" data-field="normallyClosed" ${info.normallyClosed ? "checked" : ""}> Normalt lukket (NC)</label>`);
+    fields.push(`<p class="hint">Hold trykknappen nede med Vælg-værktøjet for at ${info.normallyClosed ? "åbne" : "lukke"} den.</p>`);
+  }
+  if (info.frequency !== undefined) {
+    const waveforms = info.waveforms ?? [];
+    fields.push(`<label>Bølgeform<select data-field="waveform">${waveforms.map((w) => `<option value="${w.id}" ${w.id === info.waveform ? "selected" : ""}>${escapeHTML(w.name)}</option>`).join("")}</select></label>`);
+    if (info.hasDutyCycle) {
+      fields.push(field("Duty cycle (%)", "dutyCycle", info.dutyCycle ?? "", "50 %"));
+      fields.push(`<div class="error" data-error="dutyCycle"></div>`);
+      fields.push(info.isLowSideOutput
+        ? `<p class="hint">Ved 0 V er generatoren en low-side udgang (LSO): åben (høj) i duty cyclen og trukket ned til stel resten af perioden. Den skal trækkes op af resten af kredsløbet, fx med en pull-up-modstand.</p>`
+        : `<p class="hint">Sæt høj spænding til 0 V for at bruge den som en low-side udgang (LSO).</p>`);
+    }
+    fields.push(field("Frekvens (Hz)", "frequency", info.frequency, "ukendt"));
+    fields.push(`<div class="error" data-error="frequency"></div>`);
+    fields.push(field("Fase (°)", "phase", info.phase ?? "", "0 °"));
+    fields.push(`<div class="error" data-error="phase"></div>`);
+  }
   if (info.type === "component") {
     fields.push(`<label class="check"><input type="checkbox" data-field="showsPower" ${info.showsPower ? "checked" : ""}> Vis effekt${info.power ? ` (${escapeHTML(info.power)})` : ""}</label>`);
     fields.push(`<button data-action="flip">Vend retning</button>`);
@@ -729,6 +776,15 @@ function closePopover() {
 
 popover.addEventListener("input", (event) => {
   const input = event.target as HTMLInputElement;
+  // Another waveform shows other fields, so the editor is drawn again.
+  if (input.dataset.field === "waveform" && popover.dataset.item) {
+    app.setField(popover.dataset.item, "waveform", input.value);
+    changed();
+    const rect = popover.getBoundingClientRect();
+    const sheetRect = sheet.getBoundingClientRect();
+    openPopover({ item: popover.dataset.item, x: rect.left - sheetRect.left - 8, y: rect.top - sheetRect.top, width: 0, height: 0 });
+    return;
+  }
   const name = input.dataset.field;
   if (!name || !popover.dataset.item) return;
   const text = input.type === "checkbox" ? String(input.checked) : input.value;
@@ -868,6 +924,43 @@ dialog.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   if (target === dialog || target.hasAttribute("data-close")) dialog.close();
 });
+
+interface GuideSection {
+  id: string;
+  title: string;
+  blocks: (
+    | { kind: "text" | "tip"; text: string }
+    | { kind: "bullets"; items: string[] }
+    | { kind: "keys"; rows: { key: string; action: string }[] }
+  )[];
+}
+
+/** The guide behind the ⓘ button, from the shared Swift code (UserGuide) like the Mac app's. */
+function showGuide() {
+  const sections = JSON.parse(app.guide()) as GuideSection[];
+  // **bold** in the guide's text.
+  const styled = (text: string) => escapeHTML(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  const contents = sections.map((s) => `<a href="#guide-${s.id}" data-guide="${s.id}">${escapeHTML(s.title)}</a>`).join("");
+  const body = sections.map((section) => {
+    const blocks = section.blocks.map((block) => {
+      switch (block.kind) {
+        case "text": return `<p>${styled(block.text)}</p>`;
+        case "tip": return `<p class="tip">💡 ${styled(block.text)}</p>`;
+        case "bullets": return `<ul>${block.items.map((item) => `<li>${styled(item)}</li>`).join("")}</ul>`;
+        case "keys": return `<table class="keys">${block.rows.map((row) => `<tr><td><kbd>${escapeHTML(row.key)}</kbd></td><td>${styled(row.action)}</td></tr>`).join("")}</table>`;
+      }
+    }).join("");
+    return `<section id="guide-${section.id}"><h3>${escapeHTML(section.title)}</h3>${blocks}</section>`;
+  }).join("");
+  showDialog(`<div class="guide"><h2>Sådan bruger du JouleSketch</h2><nav class="guideContents">${contents}</nav><div class="guideBody">${body}</div></div>`);
+  dialog.classList.add("guideDialog");
+  dialog.addEventListener("close", () => dialog.classList.remove("guideDialog"), { once: true });
+  dialogBody.querySelectorAll<HTMLAnchorElement>("[data-guide]").forEach((link) =>
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      dialogBody.querySelector(`#guide-${link.dataset.guide}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }));
+}
 
 interface Report {
   isConsistent: boolean;

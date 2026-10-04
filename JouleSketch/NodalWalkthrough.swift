@@ -1,7 +1,8 @@
 import Foundation
 
 /// The node-voltage method: Kirchhoff's current law in every node, with the
-/// currents written with Ohm's law, solved by gradual substitution.
+/// currents written with Ohm's law, solved by gradual substitution. In AC
+/// the voltages and currents are phasors and the coefficients complex.
 nonisolated enum NodalWalkthrough {
     static func make(_ model: WalkModel) -> WalkResult {
         var setup: [WalkLine] = [referenceLine(model)]
@@ -18,7 +19,7 @@ nonisolated enum NodalWalkthrough {
         setup += model.knownValueLines()
 
         let system: System
-        switch equations(model, value: \.value) {
+        switch equations(model, value: model.value) {
         case .failure(let error): return .unavailable(error.text)
         case .success(let result): system = result
         }
@@ -28,7 +29,7 @@ nonisolated enum NodalWalkthrough {
         let nodeValues = values(model, solution.values)
         let controls = controlValues(model, nodeValues: nodeValues, solved: solution.values)
         let summary = model.nodes.compactMap { node in
-            model.nodeName[node].map { "\($0) = \(WalkFormat.quantity(nodeValues[node] ?? 0, .volt))" }
+            model.nodeName[node].map { "\($0) = \(WalkFormat.result(nodeValues[node] ?? .zero, .volt))" }
         }
         return .steps([
             WalkSection(title: "1. Opsætning", lines: setup),
@@ -37,7 +38,7 @@ nonisolated enum NodalWalkthrough {
             WalkSection(
                 title: "4. Resultat",
                 lines: [.text("Knudespændingerne:"), .math(summary.joined(separator: ";\\quad ")), .text("Det, der blev spurgt om:")]
-                    + targetLines(model, nodeValues: nodeValues, value: \.value, controls: controls).lines
+                    + targetLines(model, nodeValues: nodeValues, value: model.value, controls: controls).lines
             ),
         ])
     }
@@ -68,7 +69,7 @@ nonisolated enum NodalWalkthrough {
     /// What a controlled source depends on, as a linear expression in the
     /// unknowns (node voltages and controlling currents).
     struct ControlTerms {
-        var terms: [String: Double]
+        var terms: [String: Complex]
         /// V_{s} or I_{x}.
         var latex: String
         /// Written with the unknowns: (V_A - V_B), or I_{x}.
@@ -80,16 +81,16 @@ nonisolated enum NodalWalkthrough {
         guard let control = model.controls[part.component.id] else { return nil }
         switch control.kind {
         case .voltage(let plus, let minus):
-            var terms: [String: Double] = [:]
-            if plus != model.reference, let name = model.nodeName[plus] { terms[name, default: 0] += 1 }
-            if minus != model.reference, let name = model.nodeName[minus] { terms[name, default: 0] -= 1 }
+            var terms: [String: Complex] = [:]
+            if plus != model.reference, let name = model.nodeName[plus] { terms[name, default: .zero] += .one }
+            if minus != model.reference, let name = model.nodeName[minus] { terms[name, default: .zero] -= .one }
             return ControlTerms(
                 terms: terms, latex: control.latex,
                 numeric: "(\(model.voltageName(plus)) - \(model.voltageName(minus)))",
                 maple: "(\(mapleNode(plus, model, suffix: suffix)) - \(mapleNode(minus, model, suffix: suffix)))"
             )
         case .current:
-            return ControlTerms(terms: [control.latex: 1], latex: control.latex, numeric: control.latex, maple: control.maple + suffix)
+            return ControlTerms(terms: [control.latex: .one], latex: control.latex, numeric: control.latex, maple: control.maple + suffix)
         }
     }
 
@@ -97,29 +98,30 @@ nonisolated enum NodalWalkthrough {
     /// expression in the unknowns, for Kirchhoff's current law and the
     /// controlling currents. `nil` for sources that set a voltage.
     struct LinearCurrent {
-        var terms: [String: Double] = [:]
-        var constant = 0.0
+        var terms: [String: Complex] = [:]
+        var constant = Complex.zero
         var latex: String
         var numeric: String
         var maple: String
     }
 
-    static func linearCurrent(_ part: WalkPart, _ model: WalkModel, value: (WalkPart) -> Double, suffix: String) -> LinearCurrent? {
+    static func linearCurrent(_ part: WalkPart, _ model: WalkModel, value: (WalkPart) -> Complex, suffix: String) -> LinearCurrent? {
         func v(_ node: Int) -> String? { node == model.reference ? nil : model.nodeName[node] }
         switch part.kind {
-        case .resistor:
-            let r = value(part)
+        case .resistor, .capacitor, .inductor:
+            let z = value(part)
+            let across = "\(mapleNode(part.start, model, suffix: suffix)) - \(mapleNode(part.end, model, suffix: suffix))"
             var current = LinearCurrent(
-                latex: "\\frac{\(model.voltageName(part.start)) - \(model.voltageName(part.end))}{\(part.symbol)}",
-                numeric: "\\frac{\(model.voltageName(part.start)) - \(model.voltageName(part.end))}{\(WalkFormat.quantity(r, .ohm))}",
-                maple: "(\(mapleNode(part.start, model, suffix: suffix)) - \(mapleNode(part.end, model, suffix: suffix)))/\(part.mapleName)"
+                latex: "\\frac{\(model.voltageName(part.start)) - \(model.voltageName(part.end))}{\(part.impedanceSymbol)}",
+                numeric: "\\frac{\(model.voltageName(part.start)) - \(model.voltageName(part.end))}{\(WalkFormat.quantity(z, .ohm))}",
+                maple: model.mapleCurrent(part, across: across)
             )
-            if let a = v(part.start) { current.terms[a, default: 0] += 1 / r }
-            if let b = v(part.end) { current.terms[b, default: 0] -= 1 / r }
+            if let a = v(part.start) { current.terms[a, default: .zero] += .one / z }
+            if let b = v(part.end) { current.terms[b, default: .zero] -= .one / z }
             return current
         case .currentSource:
             let j = value(part)
-            return LinearCurrent(constant: j, latex: part.symbol, numeric: WalkFormat.quantity(j, .ampere), maple: j == 0 ? "0*Unit('A')" : part.mapleName)
+            return LinearCurrent(constant: j, latex: part.symbol, numeric: WalkFormat.quantity(j, .ampere), maple: j == .zero ? "0*Unit('A')" : part.mapleName)
         case .vccs, .cccs:
             let gain = value(part)
             guard let control = controlTerms(part, model, suffix: suffix) else { return nil }
@@ -129,7 +131,7 @@ nonisolated enum NodalWalkthrough {
                 numeric: "\(WalkFormat.number(gain)) \\cdot \(control.numeric)",
                 maple: "\(part.mapleName)*\(control.maple)"
             )
-        case .voltageSource, .vcvs, .ccvs:
+        case .voltageSource, .signalGenerator, .vcvs, .ccvs:
             // Kirchhoff's current law in a node where it's the only source
             // setting a voltage: its current is what the others carry away.
             for node in [part.start, part.end] {
@@ -147,7 +149,7 @@ nonisolated enum NodalWalkthrough {
                     // the start) or plus (at the end) what flows out through the others.
                     let positive = (other.start == node) != (node == part.start)
                     let sign = positive ? 1.0 : -1.0
-                    for (name, c) in otherCurrent.terms { current.terms[name, default: 0] += sign * c }
+                    for (name, c) in otherCurrent.terms { current.terms[name, default: .zero] += sign * c }
                     current.constant += sign * otherCurrent.constant
                     latex.append((!positive, otherCurrent.latex))
                     numeric.append((!positive, otherCurrent.numeric))
@@ -168,7 +170,7 @@ nonisolated enum NodalWalkthrough {
     /// superposition can switch sources off (0 V is a short, 0 A is open).
     /// `mapleSuffix` goes after the Maple names, so each source's circuit
     /// in superposition gets its own.
-    static func equations(_ model: WalkModel, value: (WalkPart) -> Double, mapleSuffix: String = "") -> Result<System, WalkError> {
+    static func equations(_ model: WalkModel, value: (WalkPart) -> Complex, mapleSuffix: String = "") -> Result<System, WalkError> {
         var system = System()
         system.unknowns = model.nodes.compactMap { model.nodeName[$0] }
         system.mapleUnknowns = model.nodes.map { mapleNode($0, model, suffix: mapleSuffix) }
@@ -229,13 +231,13 @@ nonisolated enum NodalWalkthrough {
                 var equation = LinearEquation()
                 if let plus = v(source.end) { equation.add(plus, 1) }
                 if let minus = v(source.start) { equation.add(minus, -1) }
-                if source.kind == .voltageSource {
+                if source.isIndependent {
                     let e = value(source)
                     equation.constant = e
-                    let short = e == 0 && source.value != 0 ? " (kortsluttet)" : ""
+                    let short = e == .zero && source.value != 0 ? " (kortsluttet)" : ""
                     system.lines.append(.text("(\(label())) \(source.component.name)\(short):"))
                     system.lines.append(.math("\(difference(source.end, source.start)) = \(source.symbol) = \(WalkFormat.quantity(e, .volt))"))
-                    addMaple("\(mv(source.end)) - \(mv(source.start)) = \(e == 0 ? "0*Unit('V')" : source.mapleName)")
+                    addMaple("\(mv(source.end)) - \(mv(source.start)) = \(e == .zero ? "0*Unit('V')" : source.mapleValue)")
                 } else {
                     // A controlled voltage source: the gain times what controls it.
                     let gain = value(source)
@@ -248,7 +250,7 @@ nonisolated enum NodalWalkthrough {
                     system.lines.append(.math(equation.latex(order: system.unknowns)))
                     addMaple("\(mv(source.end)) - \(mv(source.start)) = \(source.mapleName)*\(control.maple)")
                 }
-                equation.terms = equation.terms.filter { abs($0.value) > 1e-12 }
+                equation.removeZeros()
                 system.equations.append((label(), equation))
             }
             guard !hasReference else { continue }
@@ -263,13 +265,13 @@ nonisolated enum NodalWalkthrough {
                 let endInside = memberSet.contains(part.end)
                 guard startInside != endInside else { continue }
                 let (inside, outside) = startInside ? (part.start, part.end) : (part.end, part.start)
-                if part.kind == .resistor {
-                    let r = value(part)
-                    symbolic.append((false, "\\frac{\(difference(inside, outside))}{\(part.symbol)}"))
-                    numeric.append((false, "\\frac{\(difference(inside, outside))}{\(WalkFormat.quantity(r, .ohm))}"))
-                    maple.append((false, "(\(mv(inside)) - \(mv(outside)))/\(part.mapleName)"))
-                    if let x = v(inside) { equation.add(x, 1 / r) }
-                    if let y = v(outside) { equation.add(y, -1 / r) }
+                if part.isPassive {
+                    let z = value(part)
+                    symbolic.append((false, "\\frac{\(difference(inside, outside))}{\(part.impedanceSymbol)}"))
+                    numeric.append((false, "\\frac{\(difference(inside, outside))}{\(WalkFormat.quantity(z, .ohm))}"))
+                    maple.append((false, model.mapleCurrent(part, across: "\(mv(inside)) - \(mv(outside))")))
+                    if let x = v(inside) { equation.add(x, .one / z) }
+                    if let y = v(outside) { equation.add(y, -(.one / z)) }
                     continue
                 }
                 // Sources push current from their start to their end terminal,
@@ -277,7 +279,7 @@ nonisolated enum NodalWalkthrough {
                 guard let current = linearCurrent(part, model, value: value, suffix: mapleSuffix) else {
                     return .failure(.message("\(part.component.name) mangler sin styring."))
                 }
-                if part.kind == .currentSource, current.constant == 0 { continue }
+                if part.kind == .currentSource, current.constant == .zero { continue }
                 let leaving = startInside
                 let sign = leaving ? 1.0 : -1.0
                 symbolic.append((!leaving, current.latex))
@@ -287,7 +289,7 @@ nonisolated enum NodalWalkthrough {
                 equation.constant -= sign * current.constant
             }
             guard !symbolic.isEmpty else { continue }
-            equation.terms = equation.terms.filter { abs($0.value) > 1e-12 }
+            equation.removeZeros()
             let where_ = members.count == 1 ? "knude \(WalkFormat.plain(model.nodeName[members[0]] ?? ""))" : "superknuden"
             system.lines.append(.text("(\(label())) Strømloven for \(where_): summen af strømmene ud af \(members.count == 1 ? "knuden" : "superknuden") er 0."))
             system.lines.append(.math("\(joined(symbolic)) = 0"))
@@ -317,7 +319,7 @@ nonisolated enum NodalWalkthrough {
                 for (name, c) in current.terms { equation.add(name, -coefficient * c) }
                 equation.constant += coefficient * current.constant
             }
-            equation.terms = equation.terms.filter { abs($0.value) > 1e-12 }
+            equation.removeZeros()
             system.lines.append(.text("(\(label())) \(control.plain), som styrer \(part.component.name), er strømmen under \(control.plain)-punktet:"))
             system.lines.append(.math("\(control.latex) = \(symbolic.isEmpty ? "0" : joined(symbolic))"))
             if !numeric.isEmpty { system.lines.append(.math("\(control.latex) = \(joined(numeric))")) }
@@ -341,20 +343,20 @@ nonisolated enum NodalWalkthrough {
     }
 
     /// Node voltages by node, with the reference at 0 V.
-    static func values(_ model: WalkModel, _ solved: [String: Double]) -> [Int: Double] {
-        var result: [Int: Double] = [model.reference: 0]
+    static func values(_ model: WalkModel, _ solved: [String: Complex]) -> [Int: Complex] {
+        var result: [Int: Complex] = [model.reference: .zero]
         for node in model.nodes {
-            if let name = model.nodeName[node] { result[node] = solved[name] ?? 0 }
+            if let name = model.nodeName[node] { result[node] = solved[name] ?? .zero }
         }
         return result
     }
 
     /// The value of what each controlled source depends on, by source id.
-    static func controlValues(_ model: WalkModel, nodeValues: [Int: Double], solved: [String: Double]) -> [UUID: Double] {
+    static func controlValues(_ model: WalkModel, nodeValues: [Int: Complex], solved: [String: Complex]) -> [UUID: Complex] {
         model.controls.mapValues { control in
             switch control.kind {
-            case .voltage(let plus, let minus): (nodeValues[plus] ?? 0) - (nodeValues[minus] ?? 0)
-            case .current: solved[control.latex] ?? 0
+            case .voltage(let plus, let minus): (nodeValues[plus] ?? .zero) - (nodeValues[minus] ?? .zero)
+            case .current: solved[control.latex] ?? .zero
             }
         }
     }
@@ -362,12 +364,12 @@ nonisolated enum NodalWalkthrough {
     /// The voltage points and currents worked out from the node voltages.
     /// Returns the lines and each target's value (by index into `model.targets`).
     static func targetLines(
-        _ model: WalkModel, nodeValues: [Int: Double], value: (WalkPart) -> Double,
-        controls: [UUID: Double] = [:], superscript: String = ""
-    ) -> (lines: [WalkLine], values: [Int: Double]) {
+        _ model: WalkModel, nodeValues: [Int: Complex], value: (WalkPart) -> Complex,
+        controls: [UUID: Complex] = [:], superscript: String = ""
+    ) -> (lines: [WalkLine], values: [Int: Complex]) {
         var lines: [WalkLine] = []
-        var values: [Int: Double] = [:]
-        func voltage(_ node: Int?) -> Double? { node.flatMap { nodeValues[$0] } }
+        var values: [Int: Complex] = [:]
+        func voltage(_ node: Int?) -> Complex? { node.flatMap { nodeValues[$0] } }
         func name(_ node: Int) -> String { node == model.reference ? "0" : model.nodeName[node] ?? "0" }
 
         for (index, target) in model.targets.enumerated() {
@@ -382,7 +384,7 @@ nonisolated enum NodalWalkthrough {
                         continue
                     }
                     values[index] = a - b
-                    lines.append(.math("\(title) = \(name(plus)) - \(name(minus)) = \(WalkFormat.quantity(a, .volt)) - \(WalkFormat.quantityFactor(b, .volt)) = \(WalkFormat.quantity(a - b, .volt))"))
+                    lines.append(.math("\(title) = \(name(plus)) - \(name(minus)) = \(WalkFormat.quantity(a, .volt)) - \(WalkFormat.quantityFactor(b, .volt)) = \(WalkFormat.result(a - b, .volt))"))
                 } else {
                     guard let plus, let a = voltage(plus) else {
                         lines.append(.text("\(probe.name) sidder ikke på kredsløbet."))
@@ -390,10 +392,10 @@ nonisolated enum NodalWalkthrough {
                     }
                     values[index] = a
                     if name(plus) == target.name {
-                        lines.append(.math("\(title) = \(WalkFormat.quantity(a, .volt))"))
+                        lines.append(.math("\(title) = \(WalkFormat.result(a, .volt))"))
                     } else {
                         // Measured from the reference: V_o = V_B - 0.
-                        lines.append(.math("\(title) = \(name(plus)) - 0 = \(WalkFormat.quantity(a, .volt)) - 0 = \(WalkFormat.quantity(a, .volt))"))
+                        lines.append(.math("\(title) = \(name(plus)) - 0 = \(WalkFormat.quantity(a, .volt)) - 0 = \(WalkFormat.result(a, .volt))"))
                     }
                 }
             case .arrow(let arrow):
@@ -403,7 +405,7 @@ nonisolated enum NodalWalkthrough {
                 }
                 values[index] = result.value
                 lines += result.explanation
-                lines.append(.math("\(title) = \(result.symbolic) = \(result.numeric) = \(WalkFormat.quantity(result.value, .ampere))"))
+                lines.append(.math("\(title) = \(result.symbolic) = \(result.numeric) = \(WalkFormat.result(result.value, .ampere))"))
             }
         }
         return (lines, values)
@@ -413,9 +415,9 @@ nonisolated enum NodalWalkthrough {
     /// the side of its wire without voltage sources (their current isn't
     /// given by the node voltages directly).
     static func arrowCurrent(
-        _ arrow: CurrentArrow, model: WalkModel, nodeValues: [Int: Double], value: (WalkPart) -> Double,
-        controls: [UUID: Double] = [:]
-    ) -> (symbolic: String, numeric: String, value: Double, explanation: [WalkLine])? {
+        _ arrow: CurrentArrow, model: WalkModel, nodeValues: [Int: Complex], value: (WalkPart) -> Complex,
+        controls: [UUID: Complex] = [:]
+    ) -> (symbolic: String, numeric: String, value: Complex, explanation: [WalkLine])? {
         let sides = [false, true].compactMap { model.netlist.componentCoefficients(for: arrow, in: model.circuit, fromOtherSide: $0) }
         func hasVoltageSource(_ coefficients: [UUID: Double]) -> Bool {
             model.parts.contains { $0.kind.setsVoltage && abs(coefficients[$0.component.id] ?? 0) > 1e-9 }
@@ -424,7 +426,7 @@ nonisolated enum NodalWalkthrough {
 
         var symbolic: [(Bool, String)] = []
         var numeric: [(Bool, String)] = []
-        var total = 0.0
+        var total = Complex.zero
         var explanation: [WalkLine] = []
         for part in model.parts {
             let coefficient = coefficients[part.component.id] ?? 0
@@ -437,25 +439,25 @@ nonisolated enum NodalWalkthrough {
             explanation += current.explanation
         }
         if symbolic.isEmpty {
-            return ("0", "0", 0, [])
+            return ("0", "0", .zero, [])
         }
         return (joined(symbolic), joined(numeric), total, explanation)
     }
 
     /// A component's current from its start to its end terminal.
     static func componentCurrent(
-        _ part: WalkPart, model: WalkModel, nodeValues: [Int: Double], value: (WalkPart) -> Double,
-        controls: [UUID: Double] = [:]
-    ) -> (symbolic: String, numeric: String, value: Double, explanation: [WalkLine])? {
+        _ part: WalkPart, model: WalkModel, nodeValues: [Int: Complex], value: (WalkPart) -> Complex,
+        controls: [UUID: Complex] = [:]
+    ) -> (symbolic: String, numeric: String, value: Complex, explanation: [WalkLine])? {
         func name(_ node: Int) -> String { node == model.reference ? "0" : model.nodeName[node] ?? "0" }
         switch part.component.kind {
-        case .resistor:
-            let a = nodeValues[part.start] ?? 0, b = nodeValues[part.end] ?? 0
-            let r = value(part)
+        case .resistor, .capacitor, .inductor:
+            let a = nodeValues[part.start] ?? .zero, b = nodeValues[part.end] ?? .zero
+            let z = value(part)
             return (
-                "\\frac{\(name(part.start)) - \(name(part.end))}{\(part.symbol)}",
-                "\\frac{\(WalkFormat.factor(a)) - \(WalkFormat.factor(b))}{\(WalkFormat.number(r))}",
-                (a - b) / r, []
+                "\\frac{\(name(part.start)) - \(name(part.end))}{\(part.impedanceSymbol)}",
+                "\\frac{\(WalkFormat.factor(a)) - \(WalkFormat.factor(b))}{\(WalkFormat.number(z))}",
+                (a - b) / z, []
             )
         case .currentSource:
             let j = value(part)
@@ -463,9 +465,9 @@ nonisolated enum NodalWalkthrough {
         case .vccs, .cccs:
             let gain = value(part)
             guard let control = model.controls[part.component.id] else { return nil }
-            let c = controls[part.component.id] ?? 0
+            let c = controls[part.component.id] ?? .zero
             return ("\(part.valueSymbol) \\cdot \(control.latex)", "\(WalkFormat.number(gain)) \\cdot \(WalkFormat.factor(c))", gain * c, [])
-        case .voltageSource, .vcvs, .ccvs:
+        case .voltageSource, .signalGenerator, .vcvs, .ccvs:
             // Kirchhoff's current law in a node where it's the only voltage source.
             for node in [part.start, part.end] {
                 let others = model.parts.filter {
@@ -475,7 +477,7 @@ nonisolated enum NodalWalkthrough {
                 // The source's current leaves the node at its start terminal, so
                 // it's minus (at the start) or plus (at the end) what flows out
                 // of the node through the other components.
-                var current = 0.0
+                var current = Complex.zero
                 var symbolic: [(Bool, String)] = []
                 var numeric: [(Bool, String)] = []
                 for other in others {
@@ -505,7 +507,7 @@ nonisolated enum NodalWalkthrough {
 
     /// A target in Maple from the node voltages (named with `suffix`), like
     /// `targetLines` works it out. `nil` if it can't be written.
-    static func mapleTarget(_ target: WalkTarget, model: WalkModel, value: (WalkPart) -> Double, suffix: String) -> String? {
+    static func mapleTarget(_ target: WalkTarget, model: WalkModel, value: (WalkPart) -> Complex, suffix: String) -> String? {
         func voltage(_ node: Int) -> String {
             node == model.reference ? "0*Unit('V')" : mapleNode(node, model, suffix: suffix)
         }
@@ -534,14 +536,14 @@ nonisolated enum NodalWalkthrough {
 
     /// A component's current from its start to its end terminal in Maple,
     /// like `componentCurrent`.
-    static func mapleCurrent(_ part: WalkPart, model: WalkModel, value: (WalkPart) -> Double, suffix: String) -> String? {
+    static func mapleCurrent(_ part: WalkPart, model: WalkModel, value: (WalkPart) -> Complex, suffix: String) -> String? {
         switch part.component.kind {
-        case .resistor:
+        case .resistor, .capacitor, .inductor:
             let a = mapleNode(part.start, model, suffix: suffix), b = mapleNode(part.end, model, suffix: suffix)
-            return "(\(a) - \(b))/\(part.mapleName)"
+            return model.mapleCurrent(part, across: "\(a) - \(b)")
         case .currentSource, .vccs, .cccs:
             return linearCurrent(part, model, value: value, suffix: suffix)?.maple
-        case .voltageSource, .vcvs, .ccvs:
+        case .voltageSource, .signalGenerator, .vcvs, .ccvs:
             // Kirchhoff's current law in a node where it's the only voltage source.
             for node in [part.start, part.end] {
                 let others = model.parts.filter {
@@ -578,7 +580,7 @@ nonisolated enum SuperpositionWalkthrough {
             NodalWalkthrough.referenceLine(model),
         ] + model.knownValueLines())]
 
-        var contributions: [[Int: Double]] = []
+        var contributions: [[Int: Complex]] = []
         // In Maple each source's circuit gets its own names: V_A_1, L1_1, sol_1, IR2_1.
         var maple: [String] = []
         var mapleContributions: [[Int: String]] = []
@@ -586,11 +588,11 @@ nonisolated enum SuperpositionWalkthrough {
             let superscript = "^{(\(number + 1))}"
             let suffix = "_\(number + 1)"
             // Controlled sources stay on; they aren't sources of their own.
-            let value: (WalkPart) -> Double = { part in
-                !part.isIndependent || part.component.id == active.component.id ? part.value : 0
+            let value: (WalkPart) -> Complex = { part in
+                !part.isIndependent || part.component.id == active.component.id ? model.value(part) : .zero
             }
             let off = sources.filter { $0.component.id != active.component.id }.map { source in
-                "\(source.component.name) \(source.component.kind == .voltageSource ? "kortsluttes" : "afbrydes")"
+                "\(source.component.name) \(source.component.kind.setsVoltage ? "kortsluttes" : "afbrydes")"
             }
             var lines: [WalkLine] = [.text("Kun \(active.component.name) er aktiv; \(off.joined(separator: ", ")).")]
             let system: NodalWalkthrough.System
@@ -632,11 +634,12 @@ nonisolated enum SuperpositionWalkthrough {
             guard parts.allSatisfy({ $0 != nil }) else { continue }
             let values = parts.compactMap { $0 }
             let names = (1...values.count).map { "\(target.name)^{(\($0))}" }.joined(separator: " + ")
-            let numbers = values.map(WalkFormat.factor).joined(separator: " + ")
-            sum.append(.math("\(target.name) = \(names) = \(numbers) = \(WalkFormat.quantity(values.reduce(0, +), target.unit))"))
+            let numbers = values.map { WalkFormat.factor($0) }.joined(separator: " + ")
+            let total = values.reduce(Complex.zero, +)
+            sum.append(.math("\(target.name) = \(names) = \(numbers) = \(WalkFormat.result(total, target.unit))"))
             let mapleParts = mapleContributions.compactMap { $0[index] }
             if mapleParts.count == mapleContributions.count {
-                maple.append(WalkModel.mapleResult(target, mapleParts.joined(separator: " + "), value: values.reduce(0, +)))
+                maple.append(model.mapleResult(target, mapleParts.joined(separator: " + "), value: total))
             }
         }
         sections.append(WalkSection(title: "\(sources.count + 2). Resultat", lines: sum))

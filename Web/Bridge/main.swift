@@ -363,8 +363,14 @@ import JavaScriptKit
                 json.field("item", SelectionKey.encode(.component(id)))
                 json.field("title", component.kind.displayName)
                 json.field("name", component.name)
-                json.field("value", component.value.map { SIValue.format($0, unit: component.kind.displayUnit) } ?? "")
-                json.field("valueTitle", component.kind.valueTitle ?? "Værdi (\(component.kind.displayUnit))")
+                if component.kind.isSwitch {
+                    // Switches have no value; a switch has its position.
+                    if component.kind == .toggleSwitch { json.field("closed", component.isClosed == true) }
+                    if component.kind == .pushButton { json.field("normallyClosed", component.isNormallyClosed) }
+                } else {
+                    json.field("value", component.value.map { SIValue.format($0, unit: component.kind.displayUnit) } ?? "")
+                    json.field("valueTitle", component.valueTitle ?? "Værdi (\(component.kind.displayUnit))")
+                }
                 json.field("computed", solution.componentValues[id].map { SIValue.format($0, unit: component.kind.displayUnit) })
                 json.field("note", component.note)
                 json.field("isDependent", component.kind.isDependent)
@@ -372,6 +378,21 @@ import JavaScriptKit
                 json.field("controlPlaceholder", component.kind.isVoltageControlled ? "Vs" : "Is")
                 json.field("showsPower", component.isPowerShown)
                 json.field("power", solution.powerValues[id].map { SIValue.format($0, unit: "W") })
+                if component.kind == .signalGenerator {
+                    json.field("frequency", component.frequency.map { SIValue.format($0, unit: "Hz") } ?? "")
+                    json.field("phase", SIValue.format(component.phase ?? 0, unit: "°"))
+                    json.field("waveform", component.signalWaveform.rawValue)
+                    json.field("hasDutyCycle", component.signalWaveform.hasDutyCycle)
+                    json.field("isLowSideOutput", component.isLowSideOutput)
+                    json.key("waveforms")
+                    json.array(SignalWaveform.allCases) { waveform in
+                        json.object {
+                            json.field("id", waveform.rawValue)
+                            json.field("name", waveform.displayName)
+                        }
+                    }
+                    json.field("dutyCycle", SIValue.format(component.dutyCycle ?? 50, unit: "%"))
+                }
             }
         case .sense(let id):
             guard let marker = editor.circuit.senses.first(where: { $0.id == id }) else { return "" }
@@ -385,7 +406,9 @@ import JavaScriptKit
                 json.field("name", probe.name)
                 json.field("value", probe.value.map { SIValue.format($0, unit: "V") } ?? "")
                 json.field("valueTitle", "Spænding (V)")
-                json.field("computed", solution.probeValues[id].map { SIValue.format($0, unit: "V") })
+                json.field("computed", solution.probeValues[id].map {
+                    [SIValue.format($0, unit: "V", phase: solution.phases[id]), solution.fundamentalText(id, unit: "V")].compactMap { $0 }.joined(separator: " ")
+                })
                 json.field("note", probe.note)
             }
         case .currentArrow(let id):
@@ -397,7 +420,9 @@ import JavaScriptKit
                 json.field("name", arrow.name)
                 json.field("value", arrow.value.map { SIValue.format($0, unit: "A") } ?? "")
                 json.field("valueTitle", "Strøm (A)")
-                json.field("computed", solution.currentValues[id].map { SIValue.format($0, unit: "A") })
+                json.field("computed", solution.currentValues[id].map {
+                    [SIValue.format($0, unit: "A", phase: solution.phases[id]), solution.fundamentalText(id, unit: "A")].compactMap { $0 }.joined(separator: " ")
+                })
                 json.field("note", arrow.note)
             }
         case .meshMarker(let id):
@@ -429,7 +454,7 @@ import JavaScriptKit
         guard let item = SelectionKey.decode(key) else { return "" }
         // An empty value field means unknown.
         var value: Double?
-        if field == "value", !text.trimmingCharacters(in: .whitespaces).isEmpty {
+        if ["value", "frequency", "phase", "dutyCycle"].contains(field), !text.trimmingCharacters(in: .whitespaces).isEmpty {
             guard let number = SIValue.parse(text) else { return "Ugyldig værdi" }
             value = number
         }
@@ -442,9 +467,21 @@ import JavaScriptKit
                     return "Værdien kan ikke være negativ"
                 }
                 editor.updateComponent(id: id) { $0.value = value }
+            case "frequency":
+                if let value, value <= 0 { return "Frekvensen skal være positiv" }
+                editor.updateComponent(id: id) { $0.frequency = value }
+            case "phase": editor.updateComponent(id: id) { $0.phase = value }
+            case "waveform":
+                let waveform = SignalWaveform(rawValue: text) ?? .sine
+                editor.updateComponent(id: id) { $0.waveform = waveform == .sine ? nil : waveform }
+            case "dutyCycle":
+                if let value, value < 0 || value > 100 { return "Duty cycle skal være mellem 0 og 100 %" }
+                editor.updateComponent(id: id) { $0.dutyCycle = value }
             case "note": editor.updateComponent(id: id) { $0.note = text }
             case "controlName": editor.updateComponent(id: id) { $0.controlName = text.isEmpty ? nil : text }
             case "showsPower": editor.setPowerShown(text == "true", id: id)
+            case "closed": editor.updateComponent(id: id) { $0.isClosed = text == "true" ? true : nil }
+            case "normallyClosed": editor.updateComponent(id: id) { $0.normallyClosed = text == "true" ? true : nil }
             case "flip": editor.flipComponent(id: id)
             default: break
             }
@@ -538,6 +575,44 @@ import JavaScriptKit
     }
 
     /// The groups the Maple window can work with: JSON `[{id, name}]`.
+    /// The guide behind the "i" button, with the current key bindings, as JSON.
+    @JS func guide() -> String {
+        let json = JSONWriter()
+        json.array(UserGuide.sections(for: .web, keys: keyBindings)) { section in
+            json.object {
+                json.field("id", section.id)
+                json.field("title", section.title)
+                json.key("blocks")
+                json.array(section.blocks) { block in
+                    json.object {
+                        switch block {
+                        case .text(let text):
+                            json.field("kind", "text")
+                            json.field("text", text)
+                        case .tip(let text):
+                            json.field("kind", "tip")
+                            json.field("text", text)
+                        case .bullets(let items):
+                            json.field("kind", "bullets")
+                            json.key("items")
+                            json.array(items) { json.value($0) }
+                        case .keys(let rows):
+                            json.field("kind", "keys")
+                            json.key("rows")
+                            json.array(rows) { row in
+                                json.object {
+                                    json.field("key", row.key)
+                                    json.field("action", row.action)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return json.text
+    }
+
     @JS func groups() -> String {
         let json = JSONWriter()
         json.array(editor.circuit.groupAreas) { group in

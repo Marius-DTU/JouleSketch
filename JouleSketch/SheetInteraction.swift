@@ -197,6 +197,8 @@ final class SheetInteraction {
             } else if let hit = editor.hitTest(worldPoint(location), tolerance: 8 / scale) {
                 let (item, tapSelection) = selectionForHit(hit)
                 editor.selection = item
+                // A push button is closed while it's held down.
+                if let button = editor.switchComponent(hit), button.kind == .pushButton { editor.pressButton(id: button.id) }
                 dragMode = .moving(item: item, origin: start, didBegin: false, tapSelection: tapSelection)
             } else {
                 dragMode = .selectingArea(start: location, current: location)
@@ -328,10 +330,15 @@ final class SheetInteraction {
                 )
             }
         case .moving(_, _, let didBegin, let tapSelection):
+            editor.releaseButtons()
             if didBegin {
                 editor.endMove()
             } else {
                 editor.selection = tapSelection
+                // Clicking a switch opens or closes it.
+                if let toggle = editor.switchComponent(tapSelection), toggle.kind == .toggleSwitch {
+                    editor.toggleSwitch(id: toggle.id)
+                }
                 handleTap(on: tapSelection)
             }
         case .resizingGroup(_, _, _, let didBegin):
@@ -476,13 +483,18 @@ final class SheetInteraction {
 
     // MARK: Secondary button and panning
 
+    /// Where the right button went down, and how far it has moved since.
+    private var rightPress: (location: CGPoint, travel: CGFloat)?
+
     /// Right-drag pans; with ⌘ held it draws an excluded area instead.
     func beginRightDrag(at location: CGPoint) {
         cancelDrag()
+        rightPress = (location, 0)
         if isCommandDown { exclusionDraft = (location, location) }
     }
 
     func rightDrag(by delta: CGSize) {
+        if let press = rightPress { rightPress = (press.location, press.travel + hypot(delta.width, delta.height)) }
         guard let draft = exclusionDraft else {
             pan(by: delta)
             return
@@ -491,9 +503,22 @@ final class SheetInteraction {
     }
 
     func endRightDrag() {
-        guard let draft = exclusionDraft else { return }
-        exclusionDraft = nil
-        editor.addExcludedArea(from: snap(draft.start), to: snap(draft.current))
+        let press = rightPress
+        rightPress = nil
+        if let draft = exclusionDraft {
+            exclusionDraft = nil
+            if let press, press.travel < 4 { return }
+            editor.addExcludedArea(from: snap(draft.start), to: snap(draft.current))
+            return
+        }
+        // A right-click without moving opens the symbol's editor, like a double-click.
+        if let press, press.travel < 4 { rightClick(at: press.location) }
+    }
+
+    /// Opens the editor of the symbol under a right-click, if it has one.
+    func rightClick(at location: CGPoint) {
+        guard let hit = editor.hitTest(worldPoint(location), tolerance: 8 / scale), isEditable(hit) else { return }
+        openEditor(for: hit)
     }
 
     func pan(by delta: CGSize) {
@@ -504,6 +529,7 @@ final class SheetInteraction {
     func cancelDrag() {
         currentStroke = []
         powerDraft = nil
+        editor.releaseButtons()
         if case .splittingProbe(_, _, true) = dragMode {
             editor.endMove()
             dragMode = .cancelled

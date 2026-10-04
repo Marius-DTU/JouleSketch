@@ -107,17 +107,26 @@ struct InspectorView: View {
                 set: { newName in editor.updateComponent(id: component.id) { $0.name = newName } }
             ))
 
-            ValueField(
-                unit: component.kind.displayUnit, value: component.value,
-                title: component.kind.valueTitle,
-                allowsNegative: component.kind.allowsNegativeValue
-            ) { newValue in
-                editor.updateComponent(id: component.id) { $0.value = newValue }
+            if component.kind.isSwitch {
+                SwitchStateField(editor: editor, component: component)
+            } else {
+                ValueField(
+                    unit: component.kind.displayUnit, value: component.value,
+                    title: component.valueTitle,
+                    allowsNegative: component.kind.allowsNegativeValue
+                ) { newValue in
+                    editor.updateComponent(id: component.id) { $0.value = newValue }
+                }
+                .id(component.id)
             }
-            .id(component.id)
 
             if component.kind.isDependent {
                 DependentSourceControls(editor: editor, component: component)
+            }
+
+            if component.kind == .signalGenerator {
+                SignalGeneratorFields(editor: editor, component: component)
+                    .id(component.id)
             }
 
             if component.kind == .resistor,
@@ -216,8 +225,8 @@ struct InspectorView: View {
             ))
             if studyMode {
                 LabeledContent("Værdi", value: "Skjult i study mode")
-            } else if case .value(let resistance, _) = result {
-                LabeledContent("Værdi", value: SIValue.format(resistance, unit: "Ω"))
+            } else if let result, result.hasValue {
+                LabeledContent("Værdi", value: result.formatted)
                 LabeledContent("Består af", value: members.isEmpty ? "–" : members.map(\.name).formatted(.list(type: .and).locale(Locale(identifier: "da"))))
             } else {
                 LabeledContent("Værdi", value: SIValue.format(nil, unit: "Ω"))
@@ -225,7 +234,7 @@ struct InspectorView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text("Modstanden set mellem de to punkter, med spændingskilder kortsluttet og strømkilder afbrudt. En kilde, der sidder direkte mellem punkterne, fjernes. Styrede kilder bliver tændt (Req = Voc/Isc), og dioder står i deres beregnede tilstand.")
+            Text("Modstanden set mellem de to punkter, med spændingskilder kortsluttet og strømkilder afbrudt. En kilde, der sidder direkte mellem punkterne, fjernes. Styrede kilder bliver tændt (Req = Voc/Isc), og dioder står i deres beregnede tilstand. Med en signalgenerator (AC) er det impedansen med kondensatorer og spoler; i DC er en kondensator en afbrydelse og en spole en kortslutning.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             deleteButton
@@ -240,7 +249,7 @@ struct InspectorView: View {
             "\(names.formatted(.list(type: .and).locale(Locale(identifier: "da")))) indgår, men Req kan ikke findes. Tjek at styrede kilder har deres styrepunkter på kredsløbet."
         case .notConnected:
             "Der er ingen vej gennem modstande mellem de to punkter."
-        case .notOnCircuit, .value, nil:
+        case .notOnCircuit, .value, .impedance, nil:
             "Et af punkterne sidder ikke længere på kredsløbet. Slet Req og sæt den igen."
         }
     }
@@ -373,6 +382,65 @@ struct ValueField: View {
         let number = SIValue.numberPart(of: text)
         guard !unit.isEmpty, !number.isEmpty, Double(number.replacingOccurrences(of: ",", with: ".")) != nil else { return nil }
         return "\(number) \(unit)"
+    }
+}
+
+/// A switch's position, or how a push button is used.
+struct SwitchStateField: View {
+    let editor: CircuitEditor
+    let component: CircuitComponent
+
+    var body: some View {
+        if component.kind == .toggleSwitch {
+            Toggle("Lukket", isOn: Binding(
+                get: { component.isClosed == true },
+                set: { closed in editor.updateComponent(id: component.id) { $0.isClosed = closed ? true : nil } }
+            ))
+            Text("Klik på kontakten med Vælg-værktøjet for at åbne eller lukke den.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            Toggle("Normalt lukket (NC)", isOn: Binding(
+                get: { component.isNormallyClosed },
+                set: { nc in editor.updateComponent(id: component.id) { $0.normallyClosed = nc ? true : nil } }
+            ))
+            Text(component.isNormallyClosed
+                 ? "Trykknappen er lukket og åbner, mens du holder den nede med Vælg-værktøjet."
+                 : "Trykknappen er åben og lukker, mens du holder den nede med Vælg-værktøjet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// A signal generator's frequency and phase.
+struct SignalGeneratorFields: View {
+    let editor: CircuitEditor
+    let component: CircuitComponent
+
+    var body: some View {
+        Picker("Bølgeform", selection: Binding(
+            get: { component.signalWaveform },
+            set: { waveform in editor.updateComponent(id: component.id) { $0.waveform = waveform == .sine ? nil : waveform } }
+        )) {
+            ForEach(SignalWaveform.allCases) { Text($0.displayName).tag($0) }
+        }
+        if component.signalWaveform.hasDutyCycle {
+            ValueField(unit: "%", value: component.dutyCycle ?? 50, title: "Duty cycle (%)", allowsNegative: false) { newValue in
+                editor.updateComponent(id: component.id) { $0.dutyCycle = newValue.map { min($0, 100) } }
+            }
+            Text(component.isLowSideOutput
+                 ? "Ved 0 V er generatoren en low-side udgang (LSO): åben (høj) i duty cyclen og trukket ned til stel resten af perioden. Den skal trækkes op af resten af kredsløbet, fx med en pull-up-modstand."
+                 : "Sæt høj spænding til 0 V for at bruge den som en low-side udgang (LSO).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        ValueField(unit: "Hz", value: component.frequency, title: "Frekvens (Hz)", allowsNegative: false) { newValue in
+            editor.updateComponent(id: component.id) { $0.frequency = newValue }
+        }
+        ValueField(unit: "°", value: component.phase ?? 0, title: "Fase (°)") { newValue in
+            editor.updateComponent(id: component.id) { $0.phase = newValue }
+        }
     }
 }
 

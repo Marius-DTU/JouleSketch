@@ -93,8 +93,8 @@ enum ToolGroup: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .select: "Vælg"
-        case .wire: "Ledning"
-        case .resistor: "Modstand"
+        case .wire: "Ledninger, kontakter og knapper"
+        case .resistor: "Modstande, kondensatorer og spoler"
         case .sources: "Kilder"
         case .diodes: "Dioder"
         case .ground: "Stel"
@@ -106,9 +106,10 @@ enum ToolGroup: String, CaseIterable, Identifiable {
     var tools: [Tool] {
         switch self {
         case .select: [.select]
-        case .wire: [.wire]
-        case .resistor: [.component(.resistor)]
-        case .sources: [.component(.voltageSource), .component(.currentSource)] + ComponentKind.dependentSources.map { .component($0) }
+        case .wire: [.wire, .component(.toggleSwitch), .component(.pushButton)]
+        case .resistor: [.component(.resistor), .component(.capacitor), .component(.inductor)]
+        case .sources: [.component(.voltageSource), .component(.currentSource), .component(.signalGenerator)]
+            + ComponentKind.dependentSources.map { .component($0) }
         case .diodes: [.component(.diode), .component(.led)]
         case .ground: [.ground]
         case .analysis: [.probe, .current, .mesh, .power, .equivalent]
@@ -175,18 +176,57 @@ final class CircuitEditor {
             if applied != circuit { circuit = applied }
             inheritedNames = Set(globals.keys)
             documentDefinitions = globals
-            if circuit != oldValue {
-                // What lies in an excluded area doesn't take part.
-                let calculated = circuit.excludingAreas()
-                solution = CircuitSolver.solve(calculated)
-                netlist = Netlist(calculated)
-                equivalentResults = Dictionary(uniqueKeysWithValues: calculated.equivalents.map {
-                    ($0.id, CircuitSolver.equivalentResistance(
-                        between: $0.start, and: $0.end, in: calculated, netlist: netlist, solution: solution
-                    ))
-                })
-            }
+            if circuit != oldValue { recalculate() }
         }
+    }
+
+    /// Solves the circuit again, with the push buttons held down right now.
+    private func recalculate() {
+        // What lies in an excluded area doesn't take part.
+        let calculated = circuit.excludingAreas().resolvingSwitches(pressed: pressedButtons)
+        solution = CircuitSolver.solve(calculated)
+        netlist = Netlist(calculated)
+        equivalentResults = Dictionary(uniqueKeysWithValues: calculated.equivalents.map {
+            ($0.id, CircuitSolver.equivalentResistance(
+                between: $0.start, and: $0.end, in: calculated, netlist: netlist, solution: solution
+            ))
+        })
+    }
+
+    // MARK: Switches and push buttons
+
+    /// Push buttons held down right now. They're closed only while held, so
+    /// this isn't part of the document.
+    private(set) var pressedButtons: Set<UUID> = [] {
+        didSet { if pressedButtons != oldValue { recalculate() } }
+    }
+
+    /// Whether a switch or push button is closed right now.
+    func isClosed(_ component: CircuitComponent) -> Bool {
+        component.kind == .pushButton
+            ? pressedButtons.contains(component.id) != component.isNormallyClosed
+            : component.isClosed == true
+    }
+
+    /// The switch or push button at a hit, if that's what it is.
+    func switchComponent(_ hit: Selection?) -> CircuitComponent? {
+        guard case .component(let id)? = hit, let component = component(id: id), component.kind.isSwitch else { return nil }
+        return component
+    }
+
+    /// Opens a closed switch and closes an open one.
+    func toggleSwitch(id: UUID) {
+        updateComponent(id: id) { $0.isClosed = $0.isClosed == true ? nil : true }
+    }
+
+    /// Holds a push button down (closed) until `releaseButtons`.
+    func pressButton(id: UUID) {
+        pressedButtons.insert(id)
+    }
+
+    /// Lets go of all push buttons.
+    func releaseButtons() {
+        pressedButtons = []
     }
     /// Formula names whose value comes from a "!name := …" line in a text box.
     private(set) var inheritedNames: Set<String> = []
@@ -778,7 +818,9 @@ final class CircuitEditor {
             start: start,
             end: end,
             name: circuit.nextName(prefix: kind.namePrefix),
-            value: kind.defaultValue
+            value: kind.defaultValue,
+            // A signal generator starts at 1 kHz.
+            frequency: kind == .signalGenerator ? 1000 : nil
         )
         circuit.components.append(component)
         if kind.isDependent { addSenseMarkers(for: component) }

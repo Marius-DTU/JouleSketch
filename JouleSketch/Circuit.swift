@@ -24,7 +24,7 @@ nonisolated struct GridPoint: Hashable, Codable {
 }
 
 /// The kinds of two-terminal components that can be placed on the schematic.
-/// New kinds (capacitor, inductor, …) are added here and in `SymbolRenderer`.
+/// New kinds are added here, in `SymbolRenderer` and in `SymbolPainter`.
 nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
     case resistor
     case voltageSource
@@ -43,6 +43,18 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
     case diode
     /// A light-emitting diode, calculated like a diode.
     case led
+    /// A capacitor; its value is the capacitance. Open in DC.
+    case capacitor
+    /// An inductor (coil); its value is the inductance. A short circuit in DC.
+    case inductor
+    /// A sine voltage source with + at its end terminal. Its value is the
+    /// amplitude; the frequency and phase are the component's own. A circuit
+    /// with one is solved with phasors.
+    case signalGenerator
+    /// A switch that stays where it's put: clicking it opens or closes it.
+    case toggleSwitch
+    /// A push button: closed only while it's held down.
+    case pushButton
 
     var id: String { rawValue }
 
@@ -60,6 +72,11 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
         case .cccs: "Strømstyret strømkilde"
         case .diode: "Diode"
         case .led: "Lysdiode (LED)"
+        case .capacitor: "Kondensator"
+        case .inductor: "Spole"
+        case .signalGenerator: "Signalgenerator"
+        case .toggleSwitch: "Kontakt"
+        case .pushButton: "Trykknap"
         }
     }
 
@@ -69,6 +86,10 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .resistor: "R"
         case .diode, .led: "D"
+        case .capacitor: "C"
+        case .inductor: "L"
+        case .toggleSwitch: "K"
+        case .pushButton: "T"
         default: "S"
         }
     }
@@ -95,6 +116,10 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
         case .vccs: "S"
         case .cccs: "A/A"
         case .diode, .led: "V"
+        case .capacitor: "F"
+        case .inductor: "H"
+        case .signalGenerator: "V"
+        case .toggleSwitch, .pushButton: ""
         }
     }
 
@@ -111,12 +136,19 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
 
     var isDependent: Bool { Self.dependentSources.contains(self) }
     /// Sources that set a voltage (their current follows from the circuit).
-    var setsVoltage: Bool { self == .voltageSource || self == .vcvs || self == .ccvs }
+    var setsVoltage: Bool { self == .voltageSource || self == .signalGenerator || self == .vcvs || self == .ccvs }
     /// Sources that set a current (their voltage follows from the circuit).
     var setsCurrent: Bool { self == .currentSource || self == .vccs || self == .cccs }
     var isVoltageControlled: Bool { self == .vcvs || self == .vccs }
     var isCurrentControlled: Bool { self == .ccvs || self == .cccs }
     var isDiode: Bool { self == .diode || self == .led }
+    /// Capacitors and inductors, whose impedance depends on the frequency.
+    var isReactive: Bool { self == .capacitor || self == .inductor }
+    /// Switches and push buttons: a wire when closed, open otherwise. They
+    /// have no value.
+    var isSwitch: Bool { self == .toggleSwitch || self == .pushButton }
+    /// Voltage and current sources that aren't controlled.
+    var isIndependentSource: Bool { self == .voltageSource || self == .currentSource || self == .signalGenerator }
 
     /// The label of the value field, or `nil` for the plain "Værdi (unit)".
     /// The unit shown with the value. Gains are written as ratios, A/V
@@ -133,11 +165,83 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
     var valueTitle: String? {
         if isDependent { return displayUnit.isEmpty ? "Faktor \(gainSymbol)" : "Faktor \(gainSymbol) (\(displayUnit))" }
         if isDiode { return "Tærskelspænding (V)" }
-        return nil
+        switch self {
+        case .capacitor: return "Kapacitans (F)"
+        case .inductor: return "Induktans (H)"
+        case .signalGenerator: return "Amplitude (V)"
+        default: return nil
+        }
     }
 
-    /// Resistances and forward voltages can't be negative.
-    var allowsNegativeValue: Bool { self != .resistor && !isDiode }
+    /// Resistances, capacitances, inductances and forward voltages can't be negative.
+    var allowsNegativeValue: Bool { self != .resistor && !isDiode && !isReactive }
+}
+
+/// What a signal generator sends out, picked in its editor. A sine is
+/// solved with phasors directly; any other waveform is split into its
+/// average and its fundamental (the first term of its Fourier series),
+/// which are solved separately. A new waveform is a new case here with its
+/// average, fundamental and symbol (`SymbolPainter`, `SymbolRenderer`).
+nonisolated enum SignalWaveform: String, Codable, CaseIterable, Identifiable {
+    /// A sine with the generator's value as amplitude.
+    case sine
+    /// A square wave (PWM) between 0 V and the generator's value, high for
+    /// the duty cycle at the start of each period.
+    case square
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .sine: "Sinus"
+        case .square: "Firkant (PWM)"
+        }
+    }
+
+    /// The title of the generator's value field.
+    var valueTitle: String {
+        switch self {
+        case .sine: "Amplitude (V)"
+        case .square: "Høj spænding (V)"
+        }
+    }
+
+    /// Whether the waveform has a duty cycle.
+    var hasDutyCycle: Bool { self == .square }
+
+    /// The average over a period, for the value `a` and duty cycle `d` (0…1).
+    func average(_ a: Double, duty d: Double) -> Double {
+        switch self {
+        case .sine: 0
+        case .square: a * d
+        }
+    }
+
+    /// The first Fourier term as a phasor (amplitude and phase, before the
+    /// generator's own phase): the sine itself, or (2A/π)·sin(πD) ∠ −180°·D
+    /// for a square wave.
+    func fundamental(_ a: Double, duty d: Double) -> Complex {
+        switch self {
+        case .sine: Complex(a)
+        case .square: Complex(magnitude: 2 * a / .pi * sin(.pi * d), degrees: -180 * d)
+        }
+    }
+
+    /// The waveform's Fourier series in LaTeX, for the walkthrough.
+    var seriesLatex: String {
+        switch self {
+        case .sine: "v(t) = A \\cos(\\omega t)"
+        case .square: "v(t) = D A + \\frac{2A}{\\pi} \\sin(\\pi D) \\cos(\\omega t - 180^{\\circ} D) + \\ldots"
+        }
+    }
+
+    /// What the walkthrough says about the waveform.
+    var explanation: String {
+        switch self {
+        case .sine: "en sinus med amplituden A"
+        case .square: "et firkantsignal (PWM) mellem 0 og A, høj i brøkdelen D af hver periode"
+        }
+    }
 }
 
 /// A two-terminal component spanning from `start` to `end`.
@@ -166,8 +270,66 @@ nonisolated struct CircuitComponent: Identifiable, Codable, Hashable {
     /// Whether a circle around the component shows the power it absorbs.
     /// Optional so files saved before power circles existed still open.
     var showsPower: Bool?
+    /// A signal generator's frequency in Hz; `nil` means unknown.
+    var frequency: Double?
+    /// A signal generator's phase in degrees; `nil` means 0°.
+    var phase: Double?
+    /// A signal generator's waveform; `nil` means a sine.
+    var waveform: SignalWaveform?
+    /// Whether a switch is closed; `nil` means open.
+    var isClosed: Bool?
+    /// Whether a push button is normally closed (NC): closed at rest and
+    /// open while held down. `nil` means normally open (NO).
+    var normallyClosed: Bool?
+
+    /// Whether a push button is NC.
+    var isNormallyClosed: Bool { kind == .pushButton && normallyClosed == true }
+    /// A signal generator's duty cycle in percent (square wave); `nil` means 50 %.
+    var dutyCycle: Double?
+
+    /// A signal generator's waveform, a sine when not set.
+    var signalWaveform: SignalWaveform { waveform ?? .sine }
+    /// Whether this is a signal generator with a waveform other than a sine,
+    /// which is worked out as its average plus its fundamental.
+    var usesFourier: Bool { kind == .signalGenerator && signalWaveform != .sine }
+    /// Whether this is a low-side output (LSO): a square-wave generator set to
+    /// 0 V works like an open-drain output, open (high) for the duty cycle and
+    /// pulling its + terminal down to − for the rest of each period.
+    var isLowSideOutput: Bool { kind == .signalGenerator && signalWaveform == .square && value == 0 }
+    /// The duty cycle as a fraction from 0 to 1.
+    var dutyFraction: Double { min(max((dutyCycle ?? 50) / 100, 0), 1) }
+
+    /// The title of the value field, which for a signal generator depends on
+    /// the waveform.
+    var valueTitle: String? {
+        kind == .signalGenerator ? signalWaveform.valueTitle : kind.valueTitle
+    }
 
     var isPowerShown: Bool { showsPower == true }
+
+    /// What a signal generator's label shows after its amplitude: its phase
+    /// and frequency, e.g. " ∠ 30°, 1 kHz". `nil` for other components.
+    var signalDetails: String? {
+        guard kind == .signalGenerator else { return nil }
+        var text = ""
+        if let phase, phase != 0 { text += " ∠ " + SIValue.formatPhase(phase) }
+        if signalWaveform.hasDutyCycle { text += ", " + SIValue.format(dutyCycle ?? 50, unit: "%") }
+        return text + ", " + SIValue.format(frequency, unit: "Hz")
+    }
+
+    /// The whole label of a signal generator: "5 V, 10 %, 1 kHz", or just
+    /// "10 %, 1 kHz" for a low-side output, whose 0 V isn't a voltage.
+    /// `valueText` is how the voltage is written. `nil` for other components.
+    func signalLabel(valueText: String) -> String? {
+        guard let details = signalDetails else { return nil }
+        return isLowSideOutput ? String(details.drop { $0 == "," || $0 == " " }) : valueText + details
+    }
+
+    /// A signal generator's voltage as a phasor of unit amplitude: e^(jφ).
+    /// 1 for other sources.
+    var phaseFactor: Complex {
+        kind == .signalGenerator ? Complex(magnitude: 1, degrees: phase ?? 0) : Complex(1)
+    }
 
     /// The name of the power absorbed, e.g. "P_{R1}".
     var powerName: String {
@@ -1222,8 +1384,8 @@ nonisolated enum SIValue {
     /// Formats a value with an SI prefix, e.g. 4700 → "4,7 kΩ".
     static func format(_ value: Double?, unit: String) -> String {
         guard let value else { return "? \(unit)" }
-        // Ratios like V/V are shown without SI prefixes.
-        if unit == "V/V" || unit == "A/A" || unit.isEmpty {
+        // Ratios like V/V and angles are shown without SI prefixes.
+        if unit == "V/V" || unit == "A/A" || unit == "°" || unit == "%" || unit.isEmpty {
             // No thousands separator: "1.500" would read back as 1,5.
             let number = value.formatted(.number.precision(.significantDigits(1...4)).grouping(.never))
             return unit.isEmpty ? number : "\(number) \(unit)"
@@ -1269,8 +1431,26 @@ nonisolated enum SIValue {
         return number * factor / divisor
     }
 
+    /// A phasor's amplitude with its phase: "5 V ∠ −53,1°". Just the
+    /// amplitude when there's no phase (DC).
+    static func format(_ value: Double?, unit: String, phase: Double?) -> String {
+        guard let value, let phase else { return format(value, unit: unit) }
+        return "\(format(value, unit: unit)) ∠ \(formatPhase(phase))"
+    }
+
+    /// An angle in degrees with at most one decimal: "−53,1°".
+    static func formatPhase(_ degrees: Double) -> String {
+        let rounded = (degrees * 10).rounded() / 10
+        return (rounded == 0 ? 0 : rounded).formatted(.number.precision(.fractionLength(0...1)).grouping(.never)) + "°"
+    }
+
+    /// An impedance as magnitude and phase: "188 Ω ∠ −58°".
+    static func format(impedance: Complex) -> String {
+        format(impedance.magnitude, unit: "Ω", phase: impedance.degrees)
+    }
+
     /// Unit symbols that may follow a value, longest first.
-    private static let unitSymbols = ["ohm", "Ohm", "Ω", "S", "V", "A"]
+    private static let unitSymbols = ["ohm", "Ohm", "Hz", "Ω", "S", "V", "A", "F", "H", "°", "%"]
 
     /// The factor of an SI prefix; "u" and the Greek μ also mean micro.
     private static func prefixFactor(_ symbol: String) -> Double? {
@@ -1392,4 +1572,163 @@ extension Circuit {
 nonisolated struct CircuitFile: Codable {
     var version = 1
     var circuit: Circuit
+}
+
+// MARK: - Complex numbers
+
+/// A complex number, for phasors and impedances in AC circuits.
+nonisolated struct Complex: Hashable {
+    var re: Double
+    var im: Double
+
+    static let zero = Complex(0)
+    static let one = Complex(1)
+    /// The imaginary unit, written j in circuits.
+    static let j = Complex(0, 1)
+
+    init(_ re: Double, _ im: Double = 0) {
+        self.re = re
+        self.im = im
+    }
+
+    /// A phasor from its amplitude and angle in degrees.
+    init(magnitude: Double, degrees: Double) {
+        let radians = degrees * .pi / 180
+        re = magnitude * cos(radians)
+        im = magnitude * sin(radians)
+    }
+
+    var magnitude: Double { hypot(re, im) }
+    /// The angle in degrees, from −180° to 180°.
+    var degrees: Double { atan2(im, re) * 180 / .pi }
+    var conjugate: Complex { Complex(re, -im) }
+    /// Whether the imaginary part is negligible next to the real part.
+    var isReal: Bool { abs(im) <= 1e-12 * max(1, abs(re)) }
+
+    static func + (a: Complex, b: Complex) -> Complex { Complex(a.re + b.re, a.im + b.im) }
+    static func - (a: Complex, b: Complex) -> Complex { Complex(a.re - b.re, a.im - b.im) }
+    static prefix func - (a: Complex) -> Complex { Complex(-a.re, -a.im) }
+    static func * (a: Complex, b: Complex) -> Complex {
+        Complex(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+    }
+    static func * (a: Complex, k: Double) -> Complex { Complex(a.re * k, a.im * k) }
+    static func * (k: Double, a: Complex) -> Complex { Complex(a.re * k, a.im * k) }
+    static func / (a: Complex, b: Complex) -> Complex {
+        let d = b.re * b.re + b.im * b.im
+        return Complex((a.re * b.re + a.im * b.im) / d, (a.im * b.re - a.re * b.im) / d)
+    }
+    static func / (a: Complex, k: Double) -> Complex { Complex(a.re / k, a.im / k) }
+    static func += (a: inout Complex, b: Complex) { a = a + b }
+    static func -= (a: inout Complex, b: Complex) { a = a - b }
+}
+
+// MARK: - AC circuits
+
+extension Circuit {
+    /// The circuit as it's calculated: a closed switch or held-down push
+    /// button (in `pressed`) becomes a wire, an open one is taken out.
+    func resolvingSwitches(pressed: Set<UUID> = []) -> Circuit {
+        guard components.contains(where: { $0.kind.isSwitch }) else { return self }
+        var result = self
+        for component in components where component.kind.isSwitch {
+            let isClosed = component.kind == .toggleSwitch
+                ? component.isClosed == true
+                : pressed.contains(component.id) != component.isNormallyClosed
+            if isClosed { result.wires.append(Wire(id: component.id, points: [component.start, component.end])) }
+        }
+        result.components.removeAll { $0.kind.isSwitch }
+        return result
+    }
+
+    /// Whether the circuit is solved with phasors: it has a signal generator.
+    var isAC: Bool { components.contains { $0.kind == .signalGenerator } }
+
+    /// Whether a signal generator has a waveform other than a sine (e.g. a
+    /// square wave). Then the circuit is worked out in two parts: the averages
+    /// (DC) and the fundamental (phasors).
+    var usesFourier: Bool { components.contains(where: \.usesFourier) }
+
+    /// The average part: each signal generator becomes a voltage source of
+    /// its waveform's average (0 for a sine), and the rest is DC (capacitors
+    /// open, inductors shorted).
+    func averageCircuit() -> Circuit {
+        var result = self
+        for index in result.components.indices where result.components[index].kind == .signalGenerator {
+            let generator = result.components[index]
+            result.components[index].kind = .voltageSource
+            // A sine has no average, also when its amplitude is unknown.
+            result.components[index].value = generator.signalWaveform == .sine ? 0 : generator.value.map {
+                generator.signalWaveform.average($0, duty: generator.dutyFraction)
+            }
+        }
+        return result
+    }
+
+    /// The fundamental part: each signal generator becomes a sine of its
+    /// waveform's first Fourier term, and the other independent sources are
+    /// switched off. Values typed in are averages, so they're left out;
+    /// component values found for the averages are used.
+    func fundamentalCircuit(componentValues: [UUID: Double]) -> Circuit {
+        var result = self
+        for index in result.components.indices {
+            let component = result.components[index]
+            if component.value == nil, let value = componentValues[component.id] {
+                result.components[index].value = value
+            }
+            if component.kind == .signalGenerator {
+                let fundamental = component.signalWaveform.fundamental(1, duty: component.dutyFraction)
+                result.components[index].value = result.components[index].value.map { $0 * fundamental.magnitude }
+                result.components[index].phase = (component.phase ?? 0) + fundamental.degrees
+                result.components[index].waveform = nil
+            } else if component.kind == .voltageSource || component.kind == .currentSource {
+                result.components[index].value = 0
+            }
+        }
+        for index in result.probes.indices { result.probes[index].value = nil }
+        for index in result.currents.indices { result.currents[index].value = nil }
+        result.inheritedValues = []
+        return result
+    }
+
+    /// The signal generators' common frequency in Hz, or why there isn't one.
+    func acFrequency() -> Result<Double, SolverIssue> {
+        let generators = components.filter { $0.kind == .signalGenerator }
+        if let missing = generators.first(where: { ($0.frequency ?? 0) <= 0 }) {
+            return .failure(SolverIssue(
+                kind: .missing,
+                title: "\(missing.name) mangler sin frekvens",
+                detail: "Kredsløbet regnes med fasorer ved signalgeneratorens frekvens. Angiv frekvensen for \(missing.name)."
+            ))
+        }
+        let frequencies = generators.compactMap(\.frequency)
+        guard let first = frequencies.first else {
+            return .failure(SolverIssue(kind: .missing, title: "Ingen signalgenerator", detail: ""))
+        }
+        if frequencies.contains(where: { abs($0 - first) > 1e-9 * first }) {
+            return .failure(SolverIssue(
+                kind: .conflict,
+                title: "Signalgeneratorerne har forskellige frekvenser",
+                detail: "Fasorregning bruger én frekvens for hele kredsløbet. Giv alle signalgeneratorer samme frekvens, eller regn dem hver for sig med superposition."
+            ))
+        }
+        return .success(first)
+    }
+}
+
+nonisolated extension ComponentKind {
+    /// The impedance of a resistor, capacitor or inductor at angular
+    /// frequency ω (`nil` for DC). In DC a capacitor is open (∞) and an
+    /// inductor a short (0).
+    func impedance(_ value: Double, omega: Double?) -> Complex {
+        switch self {
+        case .capacitor:
+            guard let omega, value > 0 else { return Complex(.infinity) }
+            return Complex(0, -1 / (omega * value))
+        case .inductor:
+            guard let omega else { return .zero }
+            return Complex(0, omega * value)
+        default:
+            return Complex(value)
+        }
+    }
 }

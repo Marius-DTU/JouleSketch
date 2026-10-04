@@ -3,6 +3,14 @@ import CoreGraphics
 #endif
 import Foundation
 
+/// The amplitudes and phases of voltages and currents at one frequency,
+/// by the id of the voltage point or current arrow.
+nonisolated struct PhasorValues {
+    var frequency: Double
+    var values: [UUID: Double] = [:]
+    var phases: [UUID: Double] = [:]
+}
+
 /// Values the solver filled in, and what it couldn't work out.
 nonisolated struct CircuitSolution {
     /// Computed values for components whose value is unknown.
@@ -25,6 +33,24 @@ nonisolated struct CircuitSolution {
     var diodeConducts: [UUID: Bool] = [:]
     /// Each diode's voltage Vd and current Id, from anode to cathode.
     var diodeValues: [UUID: (voltage: Double, current: Double)] = [:]
+    /// The frequency in Hz when the circuit was solved with phasors (AC).
+    var frequency: Double?
+    /// In AC the phase in degrees of computed voltages and currents, by the
+    /// id of the voltage point or current arrow. Their values are amplitudes.
+    var phases: [UUID: Double] = [:]
+
+    var isAC: Bool { frequency != nil }
+
+    /// With a PWM generator the values above are averages, and this is the
+    /// fundamental (first Fourier term), solved with phasors.
+    var fundamental: PhasorValues?
+
+    /// The fundamental of a voltage point or current as text, to show after
+    /// its average: "~ 0,4 V ∠ −80°". `nil` without PWM.
+    func fundamentalText(_ id: UUID, unit: String) -> String? {
+        guard let fundamental, let value = fundamental.values[id] else { return nil }
+        return "~ " + SIValue.format(value, unit: unit, phase: fundamental.phases[id])
+    }
 
     /// The solution without the values it found, for study mode. What's
     /// missing and whether everything can be computed is still there.
@@ -36,6 +62,8 @@ nonisolated struct CircuitSolution {
         solution.powerValues = [:]
         solution.diodeConducts = [:]
         solution.diodeValues = [:]
+        solution.phases = [:]
+        solution.fundamental = nil
         return solution
     }
 
@@ -45,7 +73,7 @@ nonisolated struct CircuitSolution {
     }
 }
 
-nonisolated struct SolverIssue: Identifiable {
+nonisolated struct SolverIssue: Identifiable, Error {
     enum Kind {
         /// The known values contradict each other.
         case conflict
@@ -75,8 +103,23 @@ nonisolated struct SolverIssue: Identifiable {
 /// solved and the diode that fits its state worst (a conducting diode with
 /// current flowing backwards, or a blocking one with more than its forward
 /// voltage across it) is switched, until every diode fits.
+///
+/// A circuit with a signal generator is solved with phasors at its
+/// frequency: every voltage and current has a real and an imaginary part,
+/// capacitors and inductors have their impedance, and the other sources are
+/// phasors with phase 0. Without one it's DC, where a capacitor is open and
+/// an inductor a short.
 nonisolated enum CircuitSolver {
     static func solve(_ circuit: Circuit) -> CircuitSolution {
+        // Switches are wires or nothing; the editor resolves held-down buttons.
+        let (circuit, lowSide) = resolvingLowSideOutputs(circuit.resolvingSwitches())
+        if !lowSide.isEmpty {
+            var solution = solve(circuit)
+            solution.issues += lowSide.map(\.issue)
+            return solution
+        }
+        if circuit.usesFourier { return solveFourier(circuit) }
+        if circuit.isAC { return solveAC(circuit) }
         let diodes = circuit.components.filter { $0.kind.isDiode }
 
         /// Solves with the given diodes conducting; also returns the diode
@@ -124,12 +167,139 @@ nonisolated enum CircuitSolver {
         }
         return solution
     }
+
+    /// A low-side output (LSO) as the square wave it gives: between 0 V
+    /// (pulling down) and the voltage across it while it's open, found with
+    /// it taken out of the circuit (DC: capacitors open, inductors shorted).
+    /// With only resistors this is exact; with capacitors or inductors the
+    /// fundamental is an approximation, since an open output carries no current.
+    struct LowSideOutput {
+        let name: String
+        /// The voltage across the open output, + to −; `nil` if nothing sets it.
+        let openVoltage: Double?
+
+        var issue: SolverIssue {
+            guard let openVoltage else {
+                return SolverIssue(
+                    kind: .missing,
+                    title: "LSO-udgangen \(name) trækkes ikke op",
+                    detail: "\(name) er sat til 0 V og virker som en low-side udgang (LSO), der kun kan trække ned. Der skal noget til at trække den op, når den er åben, fx en pull-up-modstand til forsyningen."
+                )
+            }
+            return SolverIssue(
+                kind: .notice,
+                title: "\(name) er en low-side udgang (LSO)",
+                detail: "\(name) er sat til 0 V, så den virker som en open-drain-udgang: åben (høj) i duty cyclen og trukket ned til 0 V resten af perioden. Åben er spændingen over den \(SIValue.format(openVoltage, unit: "V")), så den regnes som et firkantsignal mellem 0 V og \(SIValue.format(openVoltage, unit: "V")). Med kondensatorer eller spoler er grundtonen en tilnærmelse."
+            )
+        }
+    }
+
+    /// The circuit with each low-side output replaced by a square wave from
+    /// 0 V to its open voltage, and what was found for each.
+    static func resolvingLowSideOutputs(_ circuit: Circuit) -> (Circuit, [LowSideOutput]) {
+        let outputs = circuit.components.filter(\.isLowSideOutput)
+        guard !outputs.isEmpty else { return (circuit, []) }
+        // Open: all low-side outputs taken out, the rest at its average.
+        var open = circuit
+        open.components.removeAll(where: \.isLowSideOutput)
+        open = open.averageCircuit()
+        open.probes = []
+        open.currents = []
+        open.components.indices.forEach { open.components[$0].showsPower = nil }
+        var drops: [UUID: UUID] = [:]
+        for output in outputs {
+            let probe = Probe(position: output.end, name: "LSO_\(output.name)", negative: output.start)
+            drops[output.id] = probe.id
+            open.probes.append(probe)
+        }
+        let solution = solve(open)
+        var result = circuit
+        var found: [LowSideOutput] = []
+        for output in outputs {
+            // 0 V open is nothing pulling it up (and would make it an LSO again).
+            let voltage = drops[output.id].flatMap { solution.probeValues[$0] }.flatMap { abs($0) > 1e-12 ? $0 : nil }
+            found.append(LowSideOutput(name: output.name, openVoltage: voltage))
+            if let index = result.components.firstIndex(where: { $0.id == output.id }) {
+                // Unknown if nothing pulls it up.
+                result.components[index].value = voltage
+            }
+        }
+        return (result, found)
+    }
+
+    /// Solves a circuit with a non-sine signal generator (e.g. a square wave)
+    /// in two parts: the averages (DC, each generator as its waveform's
+    /// average) and the fundamental (phasors at the generator's frequency,
+    /// the other sources off). The power is the sum of the two, leaving out
+    /// the higher harmonics.
+    private static func solveFourier(_ circuit: Circuit) -> CircuitSolution {
+        var solution = solve(circuit.averageCircuit())
+        // An unknown generator value was found as its average.
+        for generator in circuit.components where generator.kind == .signalGenerator && generator.value == nil {
+            guard let average = solution.componentValues[generator.id] else { continue }
+            let perUnit = generator.signalWaveform.average(1, duty: generator.dutyFraction)
+            solution.componentValues[generator.id] = perUnit != 0 ? average / perUnit : nil
+        }
+        let fundamentalCircuit = circuit.fundamentalCircuit(componentValues: solution.componentValues)
+        let fundamental = solveAC(fundamentalCircuit)
+        if let frequency = fundamental.frequency {
+            var values = PhasorValues(frequency: frequency)
+            for (id, value) in fundamental.probeValues { values.values[id] = value }
+            for (id, value) in fundamental.currentValues { values.values[id] = value }
+            values.phases = fundamental.phases
+            solution.fundamental = values
+            for (id, power) in fundamental.powerValues {
+                solution.powerValues[id] = solution.powerValues[id].map { $0 + power }
+            }
+        }
+        // What's missing for the fundamental, unless the averages say it already.
+        let titles = Set(solution.issues.map(\.title))
+        for issue in fundamental.issues where issue.kind != .notice && !titles.contains(issue.title) {
+            solution.issues.append(SolverIssue(kind: issue.kind, title: "Grundtone: \(issue.title)", detail: issue.detail))
+        }
+        solution.issues.append(SolverIssue(
+            kind: .notice,
+            title: "Signalet regnes som middelværdi og grundtone",
+            detail: "Værdierne er middelværdier (fx firkant = D · højspænding, kondensatorer afbrudt og spoler kortsluttet). Efter ~ står grundtonen: amplitude og fase af signalets første Fourier-led (for en firkant (2A/π)·sin(πD)) ved generatorens frekvens. Effekten er middelværdiens plus grundtonens; de højere harmoniske er udeladt."
+        ))
+        return solution
+    }
+
+    /// Solves a circuit with signal generators with phasors.
+    private static func solveAC(_ circuit: Circuit) -> CircuitSolution {
+        let frequency: Double
+        switch circuit.acFrequency() {
+        case .success(let value):
+            frequency = value
+        case .failure(let issue):
+            var solution = CircuitSolution()
+            solution.unknownCount = circuit.components.filter { $0.value == nil }.count
+                + circuit.probes.filter { $0.value == nil }.count + circuit.currents.filter { $0.value == nil }.count
+            solution.issues = [issue]
+            solution.isConsistent = issue.kind != .conflict
+            return solution
+        }
+        var model = Model(circuit: circuit, omega: 2 * .pi * frequency)
+        var solution = model.solve()
+        solution.frequency = frequency
+        if circuit.components.contains(where: { $0.kind.isDiode }) {
+            solution.issues.append(SolverIssue(
+                kind: .notice,
+                title: "Dioderne regnes som afbrudt",
+                detail: "Med fasorer (AC) kan en diode ikke lede kun den ene vej, så dioderne fører ingen strøm i beregningen."
+            ))
+        }
+        return solution
+    }
 }
 
 /// The value of an equivalent resistance (Req), or why it can't be found.
 nonisolated enum EquivalentResult: Equatable {
     /// The resistance, and the resistors carrying current between the two points.
     case value(Double, resistors: Set<UUID>)
+    /// In AC with capacitors or inductors: the impedance, and the components
+    /// carrying current between the two points.
+    case impedance(Complex, resistors: Set<UUID>)
     /// One of the points isn't on the circuit.
     case notOnCircuit
     /// No path of resistors joins the two points.
@@ -140,10 +310,34 @@ nonisolated enum EquivalentResult: Equatable {
     /// there's no single answer.
     case dependentSources([String])
 
-    /// The resistors making up the Req.
+    /// The resistors (and capacitors and inductors) making up the Req.
     var resistors: Set<UUID> {
-        if case .value(_, let resistors) = self { return resistors }
-        return []
+        switch self {
+        case .value(_, let resistors), .impedance(_, let resistors): resistors
+        default: []
+        }
+    }
+
+    /// Whether there's a resistance or impedance.
+    var hasValue: Bool {
+        switch self {
+        case .value, .impedance: true
+        default: false
+        }
+    }
+
+    /// The value as text: "1,5 kΩ", or "188 Ω ∠ −58°" for an impedance.
+    var formatted: String {
+        switch self {
+        case .value(let resistance, _): SIValue.format(resistance, unit: "Ω")
+        case .impedance(let impedance, _): SIValue.format(impedance: impedance)
+        default: SIValue.format(nil, unit: "Ω")
+        }
+    }
+
+    /// A real impedance is a resistance.
+    fileprivate static func of(_ impedance: Complex, resistors: Set<UUID>) -> EquivalentResult {
+        impedance.isReal ? .value(impedance.re, resistors: resistors) : .impedance(impedance, resistors: resistors)
     }
 }
 
@@ -155,11 +349,16 @@ nonisolated extension CircuitSolver {
     /// computed resistor values. Works by sending 1 A in at `a` and out at
     /// `b`; Req is then the voltage between them, and the resistors
     /// carrying some of that current are the ones Req is made of.
+    ///
+    /// In AC capacitors and inductors take part with their impedance, so the
+    /// result is an impedance (Zeq). In DC a capacitor is open and an
+    /// inductor a short.
     static func equivalentResistance(
         between pointA: GridPoint, and pointB: GridPoint, in circuit: Circuit, netlist: Netlist, solution: CircuitSolution
     ) -> EquivalentResult {
         guard let nodeA = netlist.node(at: pointA),
               let nodeB = netlist.node(at: pointB) else { return .notOnCircuit }
+        let omega = solution.frequency.map { 2 * .pi * $0 }
 
         // Short circuits (voltage sources and 0 Ω) join their two nodes into one.
         var parent: [Int: Int] = [:]
@@ -174,7 +373,8 @@ nonisolated extension CircuitSolver {
         }
         func node(_ point: GridPoint) -> Int { netlist.nodeOf[point, default: -1] }
 
-        var resistors: [(id: UUID, name: String, p: Int, q: Int, r: Double?)] = []
+        /// Resistors, and in AC capacitors and inductors, with their impedance.
+        var resistors: [(id: UUID, name: String, p: Int, q: Int, z: Complex?)] = []
         var dependent: [(name: String, p: Int, q: Int)] = []
         var voltageSources: [(p: Int, q: Int)] = []
         for component in circuit.components {
@@ -183,9 +383,21 @@ nonisolated extension CircuitSolver {
             case .resistor:
                 let r = component.value ?? solution.componentValues[component.id]
                 if r == 0 { join(p, q) }
-                resistors.append((component.id, component.name, p, q, r))
-            case .voltageSource: voltageSources.append((p, q))
-            case .currentSource: break
+                resistors.append((component.id, component.name, p, q, r.map { Complex($0) }))
+            case .capacitor, .inductor:
+                let value = component.value ?? solution.componentValues[component.id]
+                if omega == nil {
+                    // DC: a capacitor is open, an inductor a short.
+                    if component.kind == .inductor { join(p, q) }
+                } else if let value {
+                    let z = component.kind.impedance(value, omega: omega)
+                    if z.magnitude == 0 { join(p, q) }
+                    if z.magnitude.isFinite { resistors.append((component.id, component.name, p, q, z)) }
+                } else {
+                    resistors.append((component.id, component.name, p, q, nil))
+                }
+            case .voltageSource, .signalGenerator: voltageSources.append((p, q))
+            case .currentSource, .toggleSwitch, .pushButton: break
             case .vcvs, .ccvs, .vccs, .cccs, .diode, .led: dependent.append((component.name, p, q))
             }
         }
@@ -258,55 +470,55 @@ nonisolated extension CircuitSolver {
             }
         }
         guard !relevantResistors.isEmpty || !relevantDependent.isEmpty else { return .notConnected }
-        let unknown = relevantResistors.sorted().map { resistors[$0] }.filter { $0.r == nil }
+        let unknown = relevantResistors.sorted().map { resistors[$0] }.filter { $0.z == nil }
         guard unknown.isEmpty else { return .unknownValues(unknown.map(\.name)) }
         if !relevantDependent.isEmpty {
             // Controlled sources or diodes take part: Req = Voc / Isc, found
             // the same way with a 1 A test current and them left in.
-            return testCurrentResistance(between: nodeA, and: nodeB, in: circuit, netlist: netlist, solution: solution)
+            return testCurrentResistance(between: nodeA, and: nodeB, in: circuit, netlist: netlist, solution: solution, omega: omega)
                 ?? .dependentSources(Array(Set(relevantDependent.map { dependent[$0].name })).sorted())
         }
         let relevant = relevantResistors.map { resistors[$0] }
 
-        // Nodal analysis with b as reference: G·v = 1 A into a.
+        // Nodal analysis with b as reference: Y·v = 1 A into a.
         let blockNodes = Set(relevant.flatMap { [find($0.p), find($0.q)] })
         let nodes = blockNodes.subtracting([b]).sorted()
         let index = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1, $0) })
-        var conductance = [[Double]](repeating: [Double](repeating: 0, count: nodes.count), count: nodes.count)
+        var admittance = [[Complex]](repeating: [Complex](repeating: .zero, count: nodes.count), count: nodes.count)
         for resistor in relevant {
-            guard let r = resistor.r, r > 0 else { continue }
+            guard let z = resistor.z, z.magnitude > 0 else { continue }
             // Nodes missing from `index` are the reference b.
             let i = index[find(resistor.p)]
             let j = index[find(resistor.q)]
             guard i != j else { continue }
-            let g = 1 / r
-            if let i { conductance[i][i] += g }
-            if let j { conductance[j][j] += g }
+            let y = Complex.one / z
+            if let i { admittance[i][i] += y }
+            if let j { admittance[j][j] += y }
             if let i, let j {
-                conductance[i][j] -= g
-                conductance[j][i] -= g
+                admittance[i][j] -= y
+                admittance[j][i] -= y
             }
         }
         guard let ia = index[a] else { return .notConnected }
-        var injected = [Double](repeating: 0, count: nodes.count)
-        injected[ia] = 1
-        guard let voltages = LinearAlgebra.solve(conductance, injected) else { return .notConnected }
-        func voltage(_ n: Int) -> Double { index[find(n)].map { voltages[$0] } ?? 0 }
+        var injected = [Complex](repeating: .zero, count: nodes.count)
+        injected[ia] = .one
+        guard let voltages = LinearAlgebra.solve(admittance, injected) else { return .notConnected }
+        func voltage(_ n: Int) -> Complex { index[find(n)].map { voltages[$0] } ?? .zero }
 
         // Resistors carrying part of the 1 A test current.
         var used = Set<UUID>()
         for resistor in relevant {
-            guard let r = resistor.r, r > 0 else { continue }
-            if abs(voltage(resistor.p) - voltage(resistor.q)) / r > 1e-9 { used.insert(resistor.id) }
+            guard let z = resistor.z, z.magnitude > 0 else { continue }
+            if ((voltage(resistor.p) - voltage(resistor.q)) / z).magnitude > 1e-9 { used.insert(resistor.id) }
         }
         // A 0 Ω resistor carries current if it joins parts where current flows.
-        for resistor in resistors where resistor.r == 0 && blockNodes.contains(find(resistor.p)) {
+        for resistor in resistors where resistor.z?.magnitude == 0 && blockNodes.contains(find(resistor.p)) {
             let touchesUsed = resistors.contains { other in
                 used.contains(other.id) && [other.p, other.q].contains { find($0) == find(resistor.p) }
             }
             if touchesUsed { used.insert(resistor.id) }
         }
-        return .value(voltages[ia], resistors: used)
+        return .of(voltages[ia], resistors: used)
     }
 
     /// Req with controlled sources and diodes, by modified nodal analysis:
@@ -314,21 +526,28 @@ nonisolated extension CircuitSolver {
     /// state without their threshold voltage (conducting is a short, blocking
     /// is open), and 1 A sent in at `nodeA` and out at `nodeB`. Req is the
     /// voltage that gives. `nil` if a control is missing or there's no single
-    /// solution.
+    /// solution. In AC (`omega`) capacitors and inductors have their
+    /// impedance and diodes are open.
     private static func testCurrentResistance(
-        between nodeA: Int, and nodeB: Int, in circuit: Circuit, netlist: Netlist, solution: CircuitSolution
+        between nodeA: Int, and nodeB: Int, in circuit: Circuit, netlist: Netlist, solution: CircuitSolution, omega: Double?
     ) -> EquivalentResult? {
         func node(_ point: GridPoint) -> Int { netlist.nodeOf[point, default: -1] }
         let ends = Set([nodeA, nodeB])
+        func value(_ component: CircuitComponent) -> Double? { component.value ?? solution.componentValues[component.id] }
+        /// A resistor's, capacitor's or inductor's impedance; `nil` if unknown.
+        func impedance(_ component: CircuitComponent) -> Complex? {
+            value(component).map { component.kind.impedance($0, omega: omega) }
+        }
 
         // Only the piece of the circuit joined to the two points, through
         // components that aren't open: switched-off current sources, blocking
-        // diodes and a voltage source right between the points are.
+        // diodes, capacitors in DC and a voltage source right between the points are.
         func isOpen(_ component: CircuitComponent) -> Bool {
             switch component.kind {
-            case .currentSource: true
-            case .voltageSource: Set([node(component.start), node(component.end)]) == ends
-            case .diode, .led: solution.diodeConducts[component.id] != true
+            case .currentSource, .toggleSwitch, .pushButton: true
+            case .voltageSource, .signalGenerator: Set([node(component.start), node(component.end)]) == ends
+            case .diode, .led: omega != nil || solution.diodeConducts[component.id] != true
+            case .capacitor: omega == nil || impedance(component)?.magnitude.isFinite != true
             default: false
             }
         }
@@ -357,13 +576,13 @@ nonisolated extension CircuitSolver {
         var branch: [UUID: Int] = [:]
         for component in components {
             let setsVoltage: Bool = switch component.kind {
-            case .voltageSource:
+            case .voltageSource, .signalGenerator:
                 // A source right between the two points is taken out.
                 Set([node(component.start), node(component.end)]) != ends
             case .vcvs, .ccvs: true
-            case .resistor: (component.value ?? solution.componentValues[component.id]) == 0
-            case .diode, .led: solution.diodeConducts[component.id] == true
-            case .currentSource, .vccs, .cccs: false
+            case .resistor, .inductor: impedance(component)?.magnitude == 0
+            case .diode, .led: omega == nil && solution.diodeConducts[component.id] == true
+            case .currentSource, .vccs, .cccs, .capacitor, .toggleSwitch, .pushButton: false
             }
             if setsVoltage {
                 branch[component.id] = count
@@ -378,38 +597,38 @@ nonisolated extension CircuitSolver {
             count += 1
         }
 
-        typealias Row = [Int: Double]
-        func voltage(_ n: Int) -> Row { index[n].map { [$0: 1] } ?? [:] }
+        typealias Row = [Int: Complex]
+        func voltage(_ n: Int) -> Row { index[n].map { [$0: .one] } ?? [:] }
         func difference(_ p: Int, _ q: Int) -> Row { voltage(p).merging(voltage(q).mapValues { -$0 }, uniquingKeysWith: +) }
-        func scaled(_ row: Row, _ k: Double) -> Row { row.mapValues { $0 * k } }
+        func scaled(_ row: Row, _ k: Complex) -> Row { row.mapValues { $0 * k } }
         func controlRow(_ component: CircuitComponent) -> Row? {
             if component.kind.isVoltageControlled {
                 guard let plus = circuit.sense(of: component.id, .plus).flatMap({ netlist.nodeOf[$0.gridPoint] }),
                       let minus = circuit.sense(of: component.id, .minus).flatMap({ netlist.nodeOf[$0.gridPoint] }) else { return nil }
                 return difference(plus, minus)
             }
-            return controlCurrent[component.id].map { [$0.unknown: 1] }
+            return controlCurrent[component.id].map { [$0.unknown: .one] }
         }
         /// A component's current from start to end, linear in the unknowns.
         func current(_ component: CircuitComponent) -> Row? {
-            if let unknown = branch[component.id] { return [unknown: 1] }
+            if let unknown = branch[component.id] { return [unknown: .one] }
             let p = node(component.start), q = node(component.end)
             switch component.kind {
-            case .resistor:
-                guard let r = component.value ?? solution.componentValues[component.id], r > 0 else { return [:] }
-                return scaled(difference(p, q), 1 / r)
+            case .resistor, .capacitor, .inductor:
+                guard let z = impedance(component), z.magnitude > 0, z.magnitude.isFinite else { return [:] }
+                return scaled(difference(p, q), .one / z)
             case .vccs, .cccs:
-                return controlRow(component).map { scaled($0, component.value ?? 0) }
+                return controlRow(component).map { scaled($0, Complex(component.value ?? 0)) }
             default:
                 // Switched-off and taken-out sources, blocking diodes.
                 return [:]
             }
         }
 
-        var matrix: [[Double]] = []
-        var vector: [Double] = []
-        func add(_ row: Row, _ constant: Double) {
-            var dense = [Double](repeating: 0, count: count)
+        var matrix: [[Complex]] = []
+        var vector: [Complex] = []
+        func add(_ row: Row, _ constant: Complex) {
+            var dense = [Complex](repeating: .zero, count: count)
             for (i, k) in row { dense[i] += k }
             matrix.append(dense)
             vector.append(constant)
@@ -421,35 +640,35 @@ nonisolated extension CircuitSolver {
             outOf[node(component.start), default: [:]].merge(i, uniquingKeysWith: +)
             outOf[node(component.end), default: [:]].merge(i.mapValues { -$0 }, uniquingKeysWith: +)
         }
-        for n in index.keys.sorted() { add(outOf[n] ?? [:], n == nodeA ? 1 : 0) }
+        for n in index.keys.sorted() { add(outOf[n] ?? [:], n == nodeA ? .one : .zero) }
         // The branches that set a voltage.
         for component in components {
             guard branch[component.id] != nil else { continue }
             var row = difference(node(component.end), node(component.start))
             if component.kind == .vcvs || component.kind == .ccvs {
                 guard let control = controlRow(component) else { return nil }
-                row.merge(scaled(control, -(component.value ?? 0)), uniquingKeysWith: +)
+                row.merge(scaled(control, Complex(-(component.value ?? 0))), uniquingKeysWith: +)
             }
-            add(row, 0)
+            add(row, .zero)
         }
         // The controlling currents.
         for (_, control) in controlCurrent {
-            var row: Row = [control.unknown: 1]
+            var row: Row = [control.unknown: .one]
             for component in components {
                 guard let k = control.coefficients[component.id], k != 0, let i = current(component) else { continue }
-                row.merge(scaled(i, -k), uniquingKeysWith: +)
+                row.merge(scaled(i, Complex(-k)), uniquingKeysWith: +)
             }
-            add(row, 0)
+            add(row, .zero)
         }
         guard let ia = index[nodeA], let x = LinearAlgebra.solve(matrix, vector) else { return nil }
 
         // The resistors carrying part of the test current.
         var used = Set<UUID>()
-        for component in components where component.kind == .resistor {
+        for component in components where component.kind == .resistor || component.kind.isReactive {
             guard let i = current(component) else { continue }
-            if abs(i.reduce(0) { $0 + $1.value * x[$1.key] }) > 1e-9 { used.insert(component.id) }
+            if i.reduce(Complex.zero, { $0 + $1.value * x[$1.key] }).magnitude > 1e-9 { used.insert(component.id) }
         }
-        return .value(x[ia], resistors: used)
+        return .of(x[ia], resistors: used)
     }
 }
 
@@ -661,7 +880,8 @@ nonisolated func safeExp(_ x: Double) -> Double {
 nonisolated private struct Model {
     enum VariableKind {
         case voltage, current, parameter
-        /// The logarithm of an unknown resistance (R = e^u).
+        /// The logarithm of an unknown resistance (R = e^u), or of an unknown
+        /// capacitor's or inductor's reactance in AC.
         case logResistance
     }
 
@@ -671,18 +891,27 @@ nonisolated private struct Model {
         var name: String
         var target: Target
         /// The value as a linear function of the variables, or `nil` if it can't
-        /// be expressed at all (a current arrow in a loop of wires).
+        /// be expressed at all (a current arrow in a loop of wires). In AC the
+        /// real part of the phasor.
         var expression: [Int: Double]?
+        /// In AC the imaginary part of a voltage or current phasor.
+        var imaginary: [Int: Double]? = nil
     }
 
     let circuit: Circuit
     let netlist: Netlist
     /// The diodes assumed to conduct; the others block.
     let conducting: Set<UUID>
+    /// The angular frequency 2πf when the circuit is solved with phasors
+    /// (AC), `nil` for DC. In AC every voltage and current has a real and an
+    /// imaginary part, each with its own variable and equations.
+    let omega: Double?
     var kinds: [VariableKind] = []
     var initial: [Double] = []
-    var voltageVariable: [Int: Int] = [:]
-    var currentVariable: [UUID: Int] = [:]
+    /// Variables of the node voltages and component currents: the real part
+    /// (index 0) and, in AC, the imaginary part (index 1).
+    var voltageVariables: [[Int: Int]] = [[:], [:]]
+    var currentVariables: [[UUID: Int]] = [[:], [:]]
     var parameterVariable: [UUID: Int] = [:]
     var equations: [Equation] = []
     var unknowns: [Unknown] = []
@@ -691,10 +920,14 @@ nonisolated private struct Model {
     /// The variables at the solution, set by `solve()`.
     private(set) var point: [Double] = []
 
-    init(circuit: Circuit, conducting: Set<UUID> = []) {
+    /// 0 for the real part, and 1 for the imaginary part in AC.
+    private var parts: [Int] { omega == nil ? [0] : [0, 1] }
+
+    init(circuit: Circuit, conducting: Set<UUID> = [], omega: Double? = nil) {
         self.circuit = circuit
         self.netlist = Netlist(circuit)
         self.conducting = conducting
+        self.omega = omega
         buildVariables()
         buildEquations()
         buildUnknowns()
@@ -706,52 +939,109 @@ nonisolated private struct Model {
         return kinds.count - 1
     }
 
-    /// The variable holding a point's voltage, or `nil` for ground (always 0 V).
+    /// The variable holding a component's current (real or imaginary part).
+    private func currentVariable(_ id: UUID, part: Int = 0) -> Int? {
+        currentVariables[part][id]
+    }
+
     /// A voltage point's voltage, or a voltage drop's V(+) − V(−), as a linear
     /// function of the variables. A point on the ground node counts as 0 V.
     /// `nil` when one of a voltage drop's points isn't on the circuit.
-    private func expression(for probe: Probe) -> [Int: Double]? {
+    private func expression(for probe: Probe, part: Int = 0) -> [Int: Double]? {
         var expression: [Int: Double] = [:]
-        if let variable = voltage(at: probe.position) { expression[variable, default: 0] += 1 }
+        if let variable = voltage(at: probe.position, part: part) { expression[variable, default: 0] += 1 }
         if let negative = probe.negative {
             guard netlist.nodeOf[probe.position] != nil, netlist.nodeOf[negative] != nil else { return nil }
-            if let variable = voltage(at: negative) { expression[variable, default: 0] -= 1 }
+            if let variable = voltage(at: negative, part: part) { expression[variable, default: 0] -= 1 }
         }
         return expression.filter { $0.value != 0 }
     }
 
-    private func voltage(at point: GridPoint) -> Int? {
+    /// The variable holding a point's voltage, or `nil` for ground (always 0 V).
+    private func voltage(at point: GridPoint, part: Int = 0) -> Int? {
         guard let node = netlist.nodeOf[point], node != netlist.groundNode else { return nil }
-        return voltageVariable[node]
+        return voltageVariables[part][node]
     }
 
     private mutating func buildVariables() {
-        for node in 0..<netlist.nodeCount where node != netlist.groundNode {
-            voltageVariable[node] = addVariable(.voltage, initial: 0)
-        }
-        for component in circuit.components {
-            currentVariable[component.id] = addVariable(.current, initial: 0)
-            if component.value == nil {
-                parameterVariable[component.id] = switch component.kind {
-                case .resistor: addVariable(.logResistance, initial: log(1000))
-                case .voltageSource: addVariable(.parameter, initial: 1)
-                case .currentSource: addVariable(.parameter, initial: 0.001)
-                case .vcvs, .ccvs, .vccs, .cccs: addVariable(.parameter, initial: 1)
-                case .diode: addVariable(.parameter, initial: 0.7)
-                case .led: addVariable(.parameter, initial: 2)
-                }
+        for part in parts {
+            for node in 0..<netlist.nodeCount where node != netlist.groundNode {
+                voltageVariables[part][node] = addVariable(.voltage, initial: 0)
             }
+            for component in circuit.components {
+                currentVariables[part][component.id] = addVariable(.current, initial: 0)
+            }
+        }
+        for component in circuit.components where component.value == nil {
+            let parameter: Int? = switch component.kind {
+            case .resistor: addVariable(.logResistance, initial: log(1000))
+            // Only the reactance in AC tells a capacitance or inductance.
+            case .capacitor, .inductor: omega == nil ? nil : addVariable(.logResistance, initial: log(1000))
+            case .voltageSource, .signalGenerator: addVariable(.parameter, initial: 1)
+            case .currentSource: addVariable(.parameter, initial: 0.001)
+            case .vcvs, .ccvs, .vccs, .cccs: addVariable(.parameter, initial: 1)
+            // Diodes aren't modelled in AC.
+            case .diode: omega == nil ? addVariable(.parameter, initial: 0.7) : nil
+            case .led: omega == nil ? addVariable(.parameter, initial: 2) : nil
+            // Switches are resolved into wires before solving.
+            case .toggleSwitch, .pushButton: nil
+            }
+            if let parameter { parameterVariable[component.id] = parameter }
         }
     }
 
     private mutating func buildEquations() {
+        for part in parts { buildEquations(part: part) }
+
+        // Known voltages and currents. In AC the value is the amplitude:
+        // re² + im² − value² = 0.
+        for probe in circuit.probes {
+            guard let value = probe.value, let expression = expression(for: probe) else { continue }
+            equations.append(knownValueEquation(expression, self.expression(for: probe, part: 1), value: value, source: probe.name))
+        }
+        for arrow in circuit.currents {
+            guard let value = arrow.value, let expression = expression(for: arrow) else { continue }
+            equations.append(knownValueEquation(expression, self.expression(for: arrow, part: 1), value: value, source: arrow.name))
+        }
+    }
+
+    /// `expression = value` in DC, `|expression| = value` in AC.
+    private func knownValueEquation(_ real: [Int: Double], _ imaginary: [Int: Double]?, value: Double, source: String) -> Equation {
+        guard omega != nil, let imaginary else {
+            var equation = Equation(linear: real, sources: [source])
+            equation.constant = -value
+            return equation
+        }
+        var equation = Equation(sources: [source])
+        for expression in [real, imaginary] {
+            for (a, ka) in expression {
+                for (b, kb) in expression { equation.bilinear.append((a, b, ka * kb)) }
+            }
+        }
+        equation.constant = -value * value
+        return equation
+    }
+
+    /// The equations of the components and Kirchhoff's current law, for the
+    /// real part (0) or the imaginary part (1) of the voltages and currents.
+    private mutating func buildEquations(part: Int) {
         var kcl: [Int: Equation] = [:]
+        let isImaginary = part == 1
 
         for component in circuit.components {
-            guard let current = currentVariable[component.id] else { continue }
-            let start = voltage(at: component.start)
-            let end = voltage(at: component.end)
+            guard let current = currentVariable(component.id, part: part) else { continue }
+            let start = voltage(at: component.start, part: part)
+            let end = voltage(at: component.end, part: part)
             var equation = Equation(sources: [component.name])
+            /// A source's value split into this part: E·cos φ or E·sin φ.
+            let phase = isImaginary ? component.phaseFactor.im : component.phaseFactor.re
+            func setValue(_ coefficient: Double) {
+                if let value = component.value {
+                    equation.constant = -value * phase * coefficient
+                } else if let parameter = parameterVariable[component.id], phase != 0 {
+                    equation.linear[parameter, default: 0] -= phase * coefficient
+                }
+            }
 
             switch component.kind {
             case .resistor:
@@ -764,25 +1054,50 @@ nonisolated private struct Model {
                     // R = e^u keeps an unknown resistance positive.
                     equation.exponential.append((parameter, current, -1))
                 }
-            case .voltageSource:
+            case .capacitor, .inductor:
+                if let omega {
+                    // v = −jX·i for a capacitor (X = 1/(ωC)) and v = jX·i for an
+                    // inductor (X = ωL). Split into parts:
+                    //   capacitor: v_re − X·i_im = 0, v_im + X·i_re = 0
+                    //   inductor:  v_re + X·i_im = 0, v_im − X·i_re = 0
+                    if component.kind == .capacitor, component.value == 0 {
+                        // No capacitance: open.
+                        equation.linear[current] = 1
+                        break
+                    }
+                    if let start { equation.linear[start, default: 0] += 1 }
+                    if let end { equation.linear[end, default: 0] -= 1 }
+                    guard let other = currentVariable(component.id, part: 1 - part) else { break }
+                    let sign: Double = (component.kind == .capacitor) != isImaginary ? -1 : 1
+                    if let value = component.value {
+                        let reactance = component.kind == .capacitor ? 1 / (omega * value) : omega * value
+                        equation.linear[other, default: 0] += sign * reactance
+                    } else if let parameter = parameterVariable[component.id] {
+                        // X = e^u keeps an unknown reactance positive.
+                        equation.exponential.append((parameter, other, sign))
+                    }
+                } else if component.kind == .capacitor {
+                    // In DC a capacitor carries no current: i = 0
+                    equation.linear[current] = 1
+                } else {
+                    // In DC an inductor is a short: v(start) − v(end) = 0
+                    if let start { equation.linear[start, default: 0] += 1 }
+                    if let end { equation.linear[end, default: 0] -= 1 }
+                }
+            case .voltageSource, .signalGenerator:
                 // v(+) − v(−) − E = 0, with + at the end terminal
                 if let end { equation.linear[end, default: 0] += 1 }
                 if let start { equation.linear[start, default: 0] -= 1 }
-                if let value = component.value {
-                    equation.constant = -value
-                } else if let parameter = parameterVariable[component.id] {
-                    equation.linear[parameter] = -1
-                }
+                setValue(1)
             case .currentSource:
                 // i − J = 0, flowing from start to end through the source
                 equation.linear[current] = 1
-                if let value = component.value {
-                    equation.constant = -value
-                } else if let parameter = parameterVariable[component.id] {
-                    equation.linear[parameter] = -1
-                }
+                setValue(1)
+            case .toggleSwitch, .pushButton:
+                // Resolved into wires before solving; here an open switch: i = 0
+                equation.linear[current] = 1
             case .diode, .led:
-                if conducting.contains(component.id) {
+                if omega == nil, conducting.contains(component.id) {
                     // v(anode) − v(cathode) − Vf = 0, with the anode at the start terminal
                     if let start { equation.linear[start, default: 0] += 1 }
                     if let end { equation.linear[end, default: 0] -= 1 }
@@ -797,14 +1112,16 @@ nonisolated private struct Model {
                 }
             case .vcvs, .ccvs, .vccs, .cccs:
                 // v(+) − v(−) − gain·control = 0, or i − gain·control = 0
-                guard let control = control(of: component) else {
-                    issues.append(SolverIssue(
-                        kind: .missing,
-                        title: "\(component.name) mangler sin styring",
-                        detail: component.kind.isVoltageControlled
-                            ? "Træk + og − punkterne (Vs) for \(component.name) hen på de to steder i kredsløbet, spændingen skal måles imellem."
-                            : "Træk Is-punktet for \(component.name) hen på den ledning, hvor den styrende strøm løber. Ledningen må ikke indgå i en løkke af ledninger."
-                    ))
+                guard let control = control(of: component, part: part) else {
+                    if part == 0 {
+                        issues.append(SolverIssue(
+                            kind: .missing,
+                            title: "\(component.name) mangler sin styring",
+                            detail: component.kind.isVoltageControlled
+                                ? "Træk + og − punkterne (Vs) for \(component.name) hen på de to steder i kredsløbet, spændingen skal måles imellem."
+                                : "Træk Is-punktet for \(component.name) hen på den ledning, hvor den styrende strøm løber. Ledningen må ikke indgå i en løkke af ledninger."
+                        ))
+                    }
                     // Without its control the source adds no equation.
                     break
                 }
@@ -824,7 +1141,7 @@ nonisolated private struct Model {
                     }
                 }
             }
-            if component.kind.isDependent && control(of: component) == nil {
+            if component.kind.isDependent && control(of: component, part: part) == nil {
                 // No equation for a controlled source without its control.
             } else {
                 equations.append(equation)
@@ -842,20 +1159,6 @@ nonisolated private struct Model {
             }
         }
         equations += kcl.keys.sorted().compactMap { kcl[$0] }
-
-        for probe in circuit.probes {
-            guard let value = probe.value, let expression = expression(for: probe) else { continue }
-            var equation = Equation(linear: expression, sources: [probe.name])
-            equation.constant = -value
-            equations.append(equation)
-        }
-
-        for arrow in circuit.currents {
-            guard let value = arrow.value, let expression = expression(for: arrow) else { continue }
-            var equation = Equation(linear: expression, sources: [arrow.name])
-            equation.constant = -value
-            equations.append(equation)
-        }
     }
 
     private mutating func buildUnknowns() {
@@ -864,12 +1167,19 @@ nonisolated private struct Model {
                 unknowns.append(Unknown(name: component.name, target: .component(component.id), expression: [parameter: 1]))
             }
         }
+        let isAC = omega != nil
         for probe in circuit.probes where probe.value == nil {
             guard let expression = expression(for: probe) else { continue }
-            unknowns.append(Unknown(name: probe.name, target: .probe(probe.id), expression: expression))
+            unknowns.append(Unknown(
+                name: probe.name, target: .probe(probe.id), expression: expression,
+                imaginary: isAC ? self.expression(for: probe, part: 1) : nil
+            ))
         }
         for arrow in circuit.currents where arrow.value == nil {
-            unknowns.append(Unknown(name: arrow.name, target: .current(arrow.id), expression: expression(for: arrow)))
+            unknowns.append(Unknown(
+                name: arrow.name, target: .current(arrow.id), expression: expression(for: arrow),
+                imaginary: isAC ? expression(for: arrow, part: 1) : nil
+            ))
         }
     }
 
@@ -877,20 +1187,20 @@ nonisolated private struct Model {
     /// of the variables: the voltage between its + and − sense points (Vs),
     /// or the current in the wire under its Is marker. `nil` if the markers
     /// aren't placed on the circuit.
-    private func control(of component: CircuitComponent) -> [Int: Double]? {
+    private func control(of component: CircuitComponent, part: Int = 0) -> [Int: Double]? {
         if component.kind.isVoltageControlled {
             guard let plus = circuit.sense(of: component.id, .plus),
                   let minus = circuit.sense(of: component.id, .minus),
                   isOnCircuit(plus.gridPoint), isOnCircuit(minus.gridPoint) else { return nil }
             var result: [Int: Double] = [:]
-            if let variable = voltage(at: plus.gridPoint) { result[variable, default: 0] += 1 }
-            if let variable = voltage(at: minus.gridPoint) { result[variable, default: 0] -= 1 }
+            if let variable = voltage(at: plus.gridPoint, part: part) { result[variable, default: 0] += 1 }
+            if let variable = voltage(at: minus.gridPoint, part: part) { result[variable, default: 0] -= 1 }
             return result
         }
         if component.kind.isCurrentControlled {
             guard let marker = circuit.sense(of: component.id, .current),
                   let arrow = circuit.currentArrow(for: marker) else { return nil }
-            return expression(for: arrow)
+            return expression(for: arrow, part: part)
         }
         return nil
     }
@@ -903,11 +1213,11 @@ nonisolated private struct Model {
     }
 
     /// The current in a wire, as a sum of component currents.
-    private func expression(for arrow: CurrentArrow) -> [Int: Double]? {
+    private func expression(for arrow: CurrentArrow, part: Int = 0) -> [Int: Double]? {
         guard let coefficients = netlist.componentCoefficients(for: arrow, in: circuit) else { return nil }
         var result: [Int: Double] = [:]
         for (id, coefficient) in coefficients {
-            if let current = currentVariable[id] { result[current, default: 0] += coefficient }
+            if let current = currentVariable(id, part: part) { result[current, default: 0] += coefficient }
         }
         return result
     }
@@ -954,6 +1264,15 @@ nonisolated private struct Model {
         }
 
         let rank = RankTester(equations: equations, x: x, kinds: kinds)
+        func evaluate(_ expression: [Int: Double]) -> Double {
+            expression.reduce(0) { $0 + $1.value * x[$1.key] }
+        }
+        // Values this much smaller than the circuit's largest voltage or
+        // current are rounding noise from the solver, and shown as 0.
+        let voltageScale = zip(x, kinds).filter { $0.1 == .voltage }.map { abs($0.0) }.max() ?? 0
+        // A current counts as large next to the voltages over 1 kΩ.
+        let currentScale = max(voltageScale / 1e3, zip(x, kinds).filter { $0.1 == .current }.map { abs($0.0) }.max() ?? 0)
+        func cleaned(_ value: Double, scale: Double) -> Double { abs(value) <= 1e-9 * scale ? 0 : value }
         for unknown in unknowns {
             guard let expression = unknown.expression else {
                 issues.append(SolverIssue(
@@ -963,17 +1282,40 @@ nonisolated private struct Model {
                 ))
                 continue
             }
-            if solution.isConsistent, rank.isDetermined(expression) {
-                var value = expression.reduce(0) { $0 + $1.value * x[$1.key] }
-                // Unknown resistances are solved as their logarithm.
-                if case .component = unknown.target, expression.count == 1,
+            let isDetermined = rank.isDetermined(expression) && unknown.imaginary.map { rank.isDetermined($0) } != false
+            if solution.isConsistent, isDetermined {
+                var value = evaluate(expression)
+                var phase: Double?
+                let scale: Double = if case .current = unknown.target { currentScale } else { voltageScale }
+                if let imaginary = unknown.imaginary {
+                    // A phasor: its amplitude and phase.
+                    let phasor = Complex(value, evaluate(imaginary))
+                    let isZero = cleaned(phasor.magnitude, scale: scale) == 0
+                    value = isZero ? 0 : phasor.magnitude
+                    phase = isZero ? 0 : phasor.degrees
+                } else if case .component = unknown.target {
+                    // Component values keep their own size.
+                } else {
+                    value = cleaned(value, scale: scale)
+                }
+                // Unknown resistances (and reactances) are solved as their logarithm.
+                if case .component(let id) = unknown.target, expression.count == 1,
                    let variable = expression.keys.first, kinds[variable] == .logResistance {
                     value = safeExp(x[variable])
+                    if let omega, let kind = circuit.components.first(where: { $0.id == id })?.kind {
+                        // From the reactance: C = 1/(ωX), L = X/ω.
+                        if kind == .capacitor { value = 1 / (omega * value) }
+                        if kind == .inductor { value /= omega }
+                    }
                 }
                 switch unknown.target {
                 case .component(let id): solution.componentValues[id] = value
-                case .probe(let id): solution.probeValues[id] = value
-                case .current(let id): solution.currentValues[id] = value
+                case .probe(let id):
+                    solution.probeValues[id] = value
+                    solution.phases[id] = phase
+                case .current(let id):
+                    solution.currentValues[id] = value
+                    solution.phases[id] = phase
                 }
                 solution.solvedCount += 1
             } else if solution.isConsistent {
@@ -991,18 +1333,23 @@ nonisolated private struct Model {
 
         // The power absorbed by each component with a power circle: the
         // voltage from start to end times the current from start to end.
-        // It's known when both the voltage and the current are.
+        // It's known when both the voltage and the current are. In AC it's the
+        // average power ½·Re(V·I*), with V and I as amplitudes.
         for component in circuit.components where component.isPowerShown {
-            guard let current = currentVariable[component.id] else { continue }
             solution.unknownCount += 1
-            var voltage: [Int: Double] = [:]
-            if let start = self.voltage(at: component.start) { voltage[start, default: 0] += 1 }
-            if let end = self.voltage(at: component.end) { voltage[end, default: 0] -= 1 }
-            voltage = voltage.filter { $0.value != 0 }
+            var products: [(voltage: [Int: Double], current: Int)] = []
+            for part in parts {
+                guard let current = currentVariable(component.id, part: part) else { continue }
+                var voltage: [Int: Double] = [:]
+                if let start = self.voltage(at: component.start, part: part) { voltage[start, default: 0] += 1 }
+                if let end = self.voltage(at: component.end, part: part) { voltage[end, default: 0] -= 1 }
+                products.append((voltage.filter { $0.value != 0 }, current))
+            }
             let isOnCircuit = netlist.nodeOf[component.start] != nil && netlist.nodeOf[component.end] != nil
-            if solution.isConsistent, isOnCircuit, rank.isDetermined(voltage), rank.isDetermined([current: 1]) {
-                let u = voltage.reduce(0) { $0 + $1.value * x[$1.key] }
-                solution.powerValues[component.id] = u * x[current]
+            let isDetermined = !products.isEmpty && products.allSatisfy { rank.isDetermined($0.voltage) && rank.isDetermined([$0.current: 1]) }
+            if solution.isConsistent, isOnCircuit, isDetermined {
+                let power = products.reduce(0) { $0 + evaluate($1.voltage) * x[$1.current] }
+                solution.powerValues[component.id] = cleaned(omega == nil ? power : power / 2, scale: voltageScale * currentScale)
                 solution.solvedCount += 1
             } else if solution.isConsistent {
                 issues.append(SolverIssue(
@@ -1015,9 +1362,9 @@ nonisolated private struct Model {
 
         // Each diode's current (anode to cathode) and voltage, for checking
         // its state like by hand.
-        if solution.isConsistent {
+        if solution.isConsistent, omega == nil {
             for component in circuit.components where component.kind.isDiode {
-                guard let current = currentVariable[component.id] else { continue }
+                guard let current = currentVariable(component.id) else { continue }
                 // No voltage variable is the 0 V reference.
                 let start = self.voltage(at: component.start).map { x[$0] } ?? 0
                 let end = self.voltage(at: component.end).map { x[$0] } ?? 0
@@ -1033,11 +1380,12 @@ nonisolated private struct Model {
     /// fit: a conducting diode must carry current forwards, and a blocking
     /// one can't have more than its forward voltage across it.
     func worstDiodeViolation() -> UUID? {
+        guard omega == nil else { return nil }
         var worst: (id: UUID, amount: Double)?
         for component in circuit.components where component.kind.isDiode {
             let amount: Double
             if conducting.contains(component.id) {
-                guard let current = currentVariable[component.id] else { continue }
+                guard let current = currentVariable(component.id) else { continue }
                 // Relative to 1 mA, so tiny numerical noise doesn't count.
                 amount = -point[current] / 1e-3
             } else {
@@ -1209,6 +1557,32 @@ nonisolated private struct RankTester {
 // MARK: - Linear algebra
 
 nonisolated enum LinearAlgebra {
+    /// Solves `A·x = b` with complex numbers by Gaussian elimination with
+    /// partial pivoting.
+    static func solve(_ matrix: [[Complex]], _ vector: [Complex]) -> [Complex]? {
+        let n = vector.count
+        var a = matrix
+        var b = vector
+        for column in 0..<n {
+            guard let pivot = (column..<n).max(by: { a[$0][column].magnitude < a[$1][column].magnitude }),
+                  a[pivot][column].magnitude > 1e-300 else { return nil }
+            a.swapAt(column, pivot)
+            b.swapAt(column, pivot)
+            for row in (column + 1)..<n where a[row][column] != .zero {
+                let factor = a[row][column] / a[column][column]
+                for k in column..<n { a[row][k] -= factor * a[column][k] }
+                b[row] -= factor * b[column]
+            }
+        }
+        var x = [Complex](repeating: .zero, count: n)
+        for row in stride(from: n - 1, through: 0, by: -1) {
+            var sum = b[row]
+            for k in (row + 1)..<n { sum -= a[row][k] * x[k] }
+            x[row] = sum / a[row][row]
+        }
+        return x
+    }
+
     /// Solves `A·x = b` by Gaussian elimination with partial pivoting.
     static func solve(_ matrix: [[Double]], _ vector: [Double]) -> [Double]? {
         let n = vector.count

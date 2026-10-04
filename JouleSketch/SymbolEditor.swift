@@ -32,18 +32,25 @@ struct SymbolEditorView: View {
                         ))
                         .onSubmit { dismiss() }
 
-                        ValueField(
-                            unit: component.kind.displayUnit, value: component.value,
-                            title: component.kind.valueTitle,
-                            allowsNegative: component.kind.allowsNegativeValue
-                        ) { newValue in
-                            editor.updateComponent(id: id) { $0.value = newValue }
+                        if component.kind.isSwitch {
+                            SwitchStateField(editor: editor, component: component)
+                        } else {
+                            ValueField(
+                                unit: component.kind.displayUnit, value: component.value,
+                                title: component.valueTitle,
+                                allowsNegative: component.kind.allowsNegativeValue
+                            ) { newValue in
+                                editor.updateComponent(id: id) { $0.value = newValue }
+                            }
+                            .focused($isValueFocused)
+                            .onSubmit { dismiss() }
                         }
-                        .focused($isValueFocused)
-                        .onSubmit { dismiss() }
 
                         if component.kind.isDependent {
                             DependentSourceControls(editor: editor, component: component)
+                        }
+                        if component.kind == .signalGenerator {
+                            SignalGeneratorFields(editor: editor, component: component)
                         }
                     }
                     if component.kind == .resistor,

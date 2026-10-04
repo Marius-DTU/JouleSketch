@@ -210,12 +210,12 @@ struct ToolPalette: View {
     /// Hints for touch screens, without keyboard shortcuts.
     private func touchHint(for tool: Tool) -> String {
         switch tool {
-        case .select: "Tryk vælger · tryk to gange redigerer · træk markerer · to fingre flytter visningen"
+        case .select: "Tryk vælger · tryk to gange redigerer · træk markerer · tryk på en kontakt skifter den · hold en trykknap nede · to fingre flytter visningen"
         case .wire:
             editor.isRouting
                 ? "Tryk for støttepunkt · tryk på et forbindelsespunkt eller samme punkt igen for at slutte"
                 : "Tryk for at starte en ledning, eller træk fra punkt til punkt"
-        case .component(.voltageSource): "Tryk for at placere · eller træk fra − til +"
+        case .component(.voltageSource), .component(.signalGenerator): "Tryk for at placere · eller træk fra − til +"
         case .component(.currentSource): "Tryk for at placere · eller træk i strømmens retning"
         case .component(.diode), .component(.led): "Tryk for at placere · eller træk fra anode (+) til katode (−)"
         case .component(let kind) where kind.isDependent:
@@ -241,12 +241,12 @@ struct ToolPalette: View {
     /// Hints for mouse and trackpad, with keyboard shortcuts.
     private func pointerHint(for tool: Tool) -> String {
         switch tool {
-        case .select: "Klik vælger · ⌘-klik tilføjer · dobbeltklik redigerer · træk markerer · to fingre flytter visningen"
+        case .select: "Klik vælger · ⌘-klik tilføjer · dobbeltklik redigerer · træk markerer · klik på en kontakt skifter den · hold en trykknap nede · to fingre flytter visningen"
         case .wire:
             editor.isRouting
                 ? "Klik for støttepunkt · klik på et forbindelsespunkt for at slutte · Esc afslutter"
                 : "Klik for at starte en ledning · ⇧-træk tegner en firkant · Esc skifter til Vælg"
-        case .component(.voltageSource): "Klik for at placere · R roterer · eller træk fra − til +"
+        case .component(.voltageSource), .component(.signalGenerator): "Klik for at placere · R roterer · eller træk fra − til +"
         case .component(.currentSource): "Klik for at placere · R roterer · eller træk i strømmens retning"
         case .component(.diode), .component(.led): "Klik for at placere · R roterer · eller træk fra anode (+) til katode (−)"
         case .component(let kind) where kind.isDependent:

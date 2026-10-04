@@ -212,8 +212,8 @@ nonisolated enum MeshWalkthrough {
         struct Rise {
             var symbolic: [(Bool, String)] = []
             var maple: [(Bool, String)] = []
-            var terms: [String: Double] = [:]
-            var constant = 0.0
+            var terms: [String: Complex] = [:]
+            var constant = Complex.zero
         }
         func rise(from minus: Int, to plus: Int) -> Rise? {
             let starts = Set(outgoing.keys.filter { model.netlist.nodeOf[$0] == minus })
@@ -224,21 +224,22 @@ nonisolated enum MeshWalkthrough {
                 guard let part = edges[h / 2].part else { continue }
                 let rising = from(h) == part.component.start
                 switch part.kind {
-                case .resistor:
+                case .resistor, .capacitor, .inductor:
                     // + at the end ahead: the current against the walk.
                     let back = along(h ^ 1)
-                    result.symbolic.append((false, "\(part.symbol)(\(back.text))"))
-                    result.maple.append((false, "\(part.mapleName)*(\(alongMaple(h ^ 1)))"))
-                    for (name, c) in back.terms { result.terms[name, default: 0] += part.value * c }
-                case .voltageSource:
+                    let z = model.value(part)
+                    result.symbolic.append((false, "\(part.impedanceSymbol)(\(back.text))"))
+                    result.maple.append((false, model.mapleVoltage(part, current: alongMaple(h ^ 1))))
+                    for (name, c) in back.terms { result.terms[name, default: .zero] += z * c }
+                case .voltageSource, .signalGenerator:
                     result.symbolic.append((!rising, part.symbol))
-                    result.maple.append((!rising, part.mapleName))
-                    result.constant += rising ? part.value : -part.value
+                    result.maple.append((!rising, part.mapleValue))
+                    result.constant += rising ? part.phasor : -part.phasor
                 case .vcvs, .ccvs:
                     guard let control = model.controls[part.component.id] else { return nil }
                     result.symbolic.append((!rising, "\(part.valueSymbol) \\cdot \(control.latex)"))
                     result.maple.append((!rising, "\(part.mapleName)*\(control.maple)"))
-                    result.terms[control.latex, default: 0] += rising ? part.value : -part.value
+                    result.terms[control.latex, default: .zero] += Complex(rising ? part.value : -part.value)
                 default:
                     continue
                 }
@@ -280,7 +281,7 @@ nonisolated enum MeshWalkthrough {
                 return .unavailable("\(kind) \(part.component.name) ligger ikke mellem to masker.")
             }
             let current = along(h)
-            var equation = LinearEquation(terms: current.terms, constant: 0)
+            var equation = LinearEquation(terms: current.terms.mapValues { Complex($0) })
             let math: String
             let mapleValue: String
             if part.kind.isDependent, let control = model.controls[part.component.id] {
@@ -289,11 +290,11 @@ nonisolated enum MeshWalkthrough {
                 math = "\(current.text) = \(part.valueSymbol) \\cdot \(control.latex) = \(WalkFormat.number(part.value)) \\cdot \(control.latex)"
                 mapleValue = "\(part.mapleName)*\(control.maple)"
             } else {
-                equation.constant = part.value
-                math = "\(current.text) = \(WalkFormat.quantity(part.value, .ampere))"
-                mapleValue = part.mapleName
+                equation.constant = part.phasor
+                math = "\(current.text) = \(WalkFormat.quantity(part.phasor, .ampere))"
+                mapleValue = part.mapleValue
             }
-            equation.terms = equation.terms.filter { abs($0.value) > 1e-12 }
+            equation.removeZeros()
             let text = f != nil && g != nil
                 ? "\(kind) \(part.component.name) sidder mellem \(plainNames[f!]) og \(plainNames[g!]):"
                 : "\(kind) \(part.component.name) sidder i \(plainNames[(f ?? g)!]) og på kanten af kredsløbet:"
@@ -327,20 +328,21 @@ nonisolated enum MeshWalkthrough {
             for h in walk {
                 guard let part = edges[h / 2].part, faceOf[h] != faceOf[h ^ 1] else { continue }
                 switch part.component.kind {
-                case .resistor:
+                case .resistor, .capacitor, .inductor:
                     let current = along(h)
                     let text = alongText(h, own: f)
-                    result.symbolic.append((false, "\(part.symbol)(\(text))"))
-                    result.numeric.append((false, "\(WalkFormat.quantity(part.value, .ohm))(\(text))"))
-                    result.maple.append((false, "\(part.mapleName)*(\(alongMaple(h, own: f)))"))
-                    for (name, sign) in current.terms { result.equation.add(name, sign * part.value) }
-                case .voltageSource:
+                    let z = model.value(part)
+                    result.symbolic.append((false, "\(part.impedanceSymbol)(\(text))"))
+                    result.numeric.append((false, "\(WalkFormat.quantityFactor(z, .ohm))(\(text))"))
+                    result.maple.append((false, model.mapleVoltage(part, current: alongMaple(h, own: f))))
+                    for (name, sign) in current.terms { result.equation.add(name, sign * z) }
+                case .voltageSource, .signalGenerator:
                     // Going from − to + the voltage rises, so it counts negative.
                     let rising = from(h) == part.component.start
                     result.symbolic.append((rising, part.symbol))
-                    result.numeric.append((rising, WalkFormat.quantity(part.value, .volt)))
-                    result.maple.append((rising, part.mapleName))
-                    result.equation.constant += rising ? part.value : -part.value
+                    result.numeric.append((rising, WalkFormat.quantity(part.phasor, .volt)))
+                    result.maple.append((rising, part.mapleValue))
+                    result.equation.constant += rising ? part.phasor : -part.phasor
                 case .vcvs, .ccvs:
                     // A controlled voltage source counts like one, with gain ·
                     // control in place of its voltage; the control is an unknown.
@@ -378,7 +380,7 @@ nonisolated enum MeshWalkthrough {
                 for (name, coefficient) in part.equation.terms { total.equation.add(name, coefficient) }
                 total.equation.constant += part.equation.constant
             }
-            total.equation.terms = total.equation.terms.filter { abs($0.value) > 1e-12 }
+            total.equation.removeZeros()
             let around = members.count == 1
                 ? "maske \(plainNames[members[0]])"
                 : "én fælles ligning uden om strømkilden (\(members.map { plainNames[$0] }.joined(separator: " og ")))"
@@ -389,10 +391,11 @@ nonisolated enum MeshWalkthrough {
             // Divided by the resistance in front of the mesh's own current, the
             // equation is in amperes: that current alone, the source side a current.
             let own = names[members[0]]
-            if let resistance = total.equation.terms[own], resistance > 1e-12 {
+            if let coefficient = total.equation.terms[own], WalkFormat.isReal(coefficient), coefficient.re > 1e-12 {
+                let resistance = coefficient.re
                 var inCurrent = total.equation
                 inCurrent.terms = inCurrent.terms.mapValues { $0 / resistance }
-                inCurrent.constant /= resistance
+                inCurrent.constant = inCurrent.constant / resistance
                 equationLines.append(.text("Samlet og divideret med \(WalkFormat.number(resistance)) Ω, så ligningen står i strøm (A):"))
                 equationLines.append(.math(inCurrent.latex(order: unknowns)))
                 equations.append((label(), inCurrent))
@@ -430,7 +433,7 @@ nonisolated enum MeshWalkthrough {
                 equation.constant = expression.constant
                 equationLines.append(.text("\(label()): \(control.plain), som styrer \(part.component.name), er spændingen fra − til + (KVL langs vejen):"))
             }
-            equation.terms = equation.terms.filter { abs($0.value) > 1e-12 }
+            equation.removeZeros()
             equationLines.append(.math("\(control.latex) = \(symbolic)"))
             equationLines.append(.text("Samlet efter de ubekendte:"))
             equationLines.append(.math(equation.latex(order: unknowns)))
@@ -442,9 +445,9 @@ nonisolated enum MeshWalkthrough {
               let solution = Substitution.solve(equations, unknowns: unknowns) else {
             return .unavailable("Maskeligningerne har ikke én løsning.")
         }
-        func current(_ name: String) -> Double { solution.values[name] ?? 0 }
-        func value(_ h: Int) -> Double {
-            along(h).terms.reduce(0) { $0 + $1.value * current($1.key) }
+        func current(_ name: String) -> Complex { solution.values[name] ?? .zero }
+        func value(_ h: Int) -> Complex {
+            along(h).terms.reduce(Complex.zero) { $0 + $1.value * current($1.key) }
         }
         /// "4 [[mA]] - 0,25 [[mA]]" for a half-edge, like its `along` text.
         func numbers(_ h: Int) -> String {
@@ -459,13 +462,13 @@ nonisolated enum MeshWalkthrough {
         // 6: what was asked for.
         var results: [WalkLine] = [
             .text("5: Maskestrømmene:"),
-            .math(names.map { "\($0) = \(WalkFormat.quantity(current($0), .ampere))" }.joined(separator: ";\\quad ")),
+            .math(names.map { "\($0) = \(WalkFormat.result(current($0), .ampere))" }.joined(separator: ";\\quad ")),
         ]
         if !controlled.isEmpty {
             results.append(.text("Styrestørrelserne:"))
             results.append(.math(controlled.map { item in
                 let unit: PhysicalUnit = if case .voltage = item.control.kind { .volt } else { .ampere }
-                return "\(item.control.latex) = \(WalkFormat.quantity(current(item.control.latex), unit))"
+                return "\(item.control.latex) = \(WalkFormat.result(current(item.control.latex), unit))"
             }.joined(separator: ";\\quad ")))
         }
         results += [
@@ -478,8 +481,8 @@ nonisolated enum MeshWalkthrough {
                     results.append(.text("Strømmen \(arrow.name) kan ikke findes på tegningen."))
                     continue
                 }
-                results.append(.math("\(target.name) = \(along(h).text) = \(numbers(h)) = \(WalkFormat.quantity(value(h), .ampere))"))
-                maple.append(WalkModel.mapleResult(target, "eval(\(alongMaple(h)), sol)", value: value(h)))
+                results.append(.math("\(target.name) = \(along(h).text) = \(numbers(h)) = \(WalkFormat.result(value(h), .ampere))"))
+                maple.append(model.mapleResult(target, "eval(\(alongMaple(h)), sol)", value: value(h)))
             case .probe(let probe):
                 // From the reference (or the − point) to the point: the voltage
                 // over each resistor on the way, then KVL along the way.
@@ -492,27 +495,28 @@ nonisolated enum MeshWalkthrough {
                 var symbolic: [(Bool, String)] = []
                 var numeric: [(Bool, String)] = []
                 var mapleTerms: [(Bool, String)] = []
-                var total = 0.0
+                var total = Complex.zero
                 var resistorLines: [WalkLine] = []
                 for h in path {
                     guard let part = edges[h / 2].part else { continue }
                     switch part.component.kind {
-                    case .resistor:
+                    case .resistor, .capacitor, .inductor:
                         // + at the end nearer the point: the current against the walk.
                         let back = h ^ 1
-                        let v = part.value * value(back)
+                        let z = model.value(part)
+                        let v = z * value(back)
                         let name = "V_{\(part.component.name)}"
-                        resistorLines.append(.math("\(name)(\\pm) = \(part.symbol)(\(along(back).text)) = \(WalkFormat.quantity(part.value, .ohm)) \\cdot (\(numbers(back))) = \(WalkFormat.quantity(v, .volt))"))
+                        resistorLines.append(.math("\(name)(\\pm) = \(part.impedanceSymbol)(\(along(back).text)) = \(WalkFormat.quantity(z, .ohm)) \\cdot (\(numbers(back))) = \(WalkFormat.quantity(v, .volt))"))
                         symbolic.append((false, name))
                         numeric.append((false, WalkFormat.quantityFactor(v, .volt)))
-                        mapleTerms.append((false, "\(part.mapleName)*(\(alongMaple(back)))"))
+                        mapleTerms.append((false, model.mapleVoltage(part, current: alongMaple(back))))
                         total += v
-                    case .voltageSource:
+                    case .voltageSource, .signalGenerator:
                         let rising = from(h) == part.component.start
                         symbolic.append((!rising, part.symbol))
-                        numeric.append((!rising, WalkFormat.quantity(part.value, .volt)))
-                        mapleTerms.append((!rising, part.mapleName))
-                        total += rising ? part.value : -part.value
+                        numeric.append((!rising, WalkFormat.quantity(part.phasor, .volt)))
+                        mapleTerms.append((!rising, part.mapleValue))
+                        total += rising ? part.phasor : -part.phasor
                     case .vcvs, .ccvs:
                         guard let control = model.controls[part.component.id] else { continue }
                         let rising = from(h) == part.component.start
@@ -528,18 +532,18 @@ nonisolated enum MeshWalkthrough {
                     }
                 }
                 let expression = mapleTerms.isEmpty ? "0*Unit('V')" : NodalWalkthrough.joined(mapleTerms)
-                maple.append(WalkModel.mapleResult(target, "eval(\(expression), sol)", value: total))
+                maple.append(model.mapleResult(target, "eval(\(expression), sol)", value: total))
                 results += resistorLines
                 if symbolic.isEmpty {
                     results.append(.math("\(target.name) = \(WalkFormat.quantity(0, .volt))"))
                 } else if symbolic.count == 1, resistorLines.count == 1, !symbolic[0].0 {
                     // Just the voltage over one resistor; say so unless it has the same name.
                     if FormulaParts.key(target.name) != FormulaParts.key(symbolic[0].1) {
-                        results.append(.math("\(target.name) = \(symbolic[0].1) = \(WalkFormat.quantity(total, .volt))"))
+                        results.append(.math("\(target.name) = \(symbolic[0].1) = \(WalkFormat.result(total, .volt))"))
                     }
                 } else {
                     results.append(.text("KVL \(probe.negative == nil ? "fra referencen hen til \(probe.name)" : "fra − til + ved \(probe.name)"):"))
-                    results.append(.math("\(target.name) = \(NodalWalkthrough.joined(symbolic)) = \(NodalWalkthrough.joined(numeric)) = \(WalkFormat.quantity(total, .volt))"))
+                    results.append(.math("\(target.name) = \(NodalWalkthrough.joined(symbolic)) = \(NodalWalkthrough.joined(numeric)) = \(WalkFormat.result(total, .volt))"))
                 }
             }
         }

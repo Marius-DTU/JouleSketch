@@ -14,6 +14,9 @@ enum SymbolRenderer {
         lineWidth: CGFloat,
         resistorStyle: ResistorStyle = .iec,
         isLit: Bool = false,
+        waveform: SignalWaveform = .sine,
+        isClosed: Bool = false,
+        isNormallyClosed: Bool = false,
         in context: GraphicsContext
     ) {
         let length = a.distance(to: b)
@@ -98,6 +101,101 @@ enum SymbolRenderer {
                     local.stroke(arrow, with: .color(arrowColor), style: StrokeStyle(lineWidth: max(1, lineWidth * 0.75), lineCap: .round, lineJoin: .round))
                 }
             }
+
+        case .toggleSwitch, .pushButton:
+            // Two contacts; a switch has an arm hinged at the first, raised
+            // when open, and a push button a bridge pressed down onto both.
+            let x0 = center - halfBody * 0.7, x1 = center + halfBody * 0.7
+            let dot = unit * 0.12
+            var path = Path()
+            path.move(to: CGPoint(x: center - halfBody, y: 0))
+            path.addLine(to: CGPoint(x: x0 - dot, y: 0))
+            path.move(to: CGPoint(x: x1 + dot, y: 0))
+            path.addLine(to: CGPoint(x: center + halfBody, y: 0))
+            for x in [x0, x1] {
+                path.addEllipse(in: CGRect(x: x - dot, y: -dot, width: dot * 2, height: dot * 2))
+            }
+            if kind == .toggleSwitch {
+                let reach = x1 - x0
+                let angle = isClosed ? 0 : CGFloat.pi / 6
+                path.move(to: CGPoint(x: x0, y: 0))
+                path.addLine(to: CGPoint(x: x0 + reach * cos(angle), y: -reach * sin(angle)))
+            } else {
+                // An NC button's bridge rests under the contacts and is pushed
+                // away downwards; an NO button's is pushed down onto them.
+                let bar: CGFloat = isNormallyClosed
+                    ? (isClosed ? dot * 1.3 : unit * 0.5)
+                    : (isClosed ? -dot * 1.3 : -unit * 0.5)
+                let top = min(bar, 0) - unit * 0.45 - (isNormallyClosed ? unit * 0.2 : 0)
+                path.move(to: CGPoint(x: x0, y: bar))
+                path.addLine(to: CGPoint(x: x1, y: bar))
+                path.move(to: CGPoint(x: center, y: bar))
+                path.addLine(to: CGPoint(x: center, y: top))
+                path.move(to: CGPoint(x: center - unit * 0.25, y: top))
+                path.addLine(to: CGPoint(x: center + unit * 0.25, y: top))
+            }
+            local.stroke(path, with: .color(color), style: style)
+
+        case .capacitor:
+            // Two plates with a gap between them.
+            let gap = halfBody * 0.22
+            let plate = unit * 0.75
+            var path = Path()
+            path.move(to: CGPoint(x: center - halfBody, y: 0))
+            path.addLine(to: CGPoint(x: center - gap, y: 0))
+            path.move(to: CGPoint(x: center + gap, y: 0))
+            path.addLine(to: CGPoint(x: center + halfBody, y: 0))
+            for x in [center - gap, center + gap] {
+                path.move(to: CGPoint(x: x, y: -plate))
+                path.addLine(to: CGPoint(x: x, y: plate))
+            }
+            local.stroke(path, with: .color(color), style: style)
+
+        case .inductor:
+            // Four half loops on one side of the line.
+            let loops = 4
+            let radius = halfBody / CGFloat(loops)
+            var path = Path()
+            path.move(to: CGPoint(x: center - halfBody, y: 0))
+            for loop in 0..<loops {
+                let middle = center - halfBody + radius * CGFloat(2 * loop + 1)
+                for step in 1...12 {
+                    let angle = CGFloat.pi * (1 - CGFloat(step) / 12)
+                    path.addLine(to: CGPoint(x: middle + radius * cos(angle), y: -radius * sin(angle)))
+                }
+            }
+            local.stroke(path, with: .color(color), style: style)
+
+        case .signalGenerator:
+            // A circle with a sine wave, and + towards the end terminal.
+            // The wave and signs are drawn upright, in the unrotated context.
+            local.stroke(
+                Path(ellipseIn: CGRect(x: center - halfBody, y: -halfBody, width: halfBody * 2, height: halfBody * 2)),
+                with: .color(color), style: style
+            )
+            let direction = CGPoint(x: (b.x - a.x) / length, y: (b.y - a.y) / length)
+            func along(_ distance: CGFloat) -> CGPoint {
+                CGPoint(x: a.x + direction.x * distance, y: a.y + direction.y * distance)
+            }
+            let middle = along(center)
+            // Narrower when lying down, so the wave keeps clear of the signs.
+            let width = halfBody * (abs(direction.x) > abs(direction.y) ? 0.3 : 0.45), height = halfBody * 0.25
+            // The waveform, one period across the middle (shared with the web version).
+            let points = SymbolPainter.wavePoints(waveform).map { CGPoint(x: middle.x + width * $0.x, y: middle.y + height * $0.y) }
+            var wave = Path()
+            wave.addLines(points)
+            context.stroke(wave, with: .color(color), style: style)
+            let sign = halfBody * 0.14
+            let plus = along(center + halfBody * 0.68)
+            let minus = along(center - halfBody * 0.68)
+            var signs = Path()
+            signs.move(to: CGPoint(x: plus.x - sign, y: plus.y))
+            signs.addLine(to: CGPoint(x: plus.x + sign, y: plus.y))
+            signs.move(to: CGPoint(x: plus.x, y: plus.y - sign))
+            signs.addLine(to: CGPoint(x: plus.x, y: plus.y + sign))
+            signs.move(to: CGPoint(x: minus.x - sign, y: minus.y))
+            signs.addLine(to: CGPoint(x: minus.x + sign, y: minus.y))
+            context.stroke(signs, with: .color(color), style: StrokeStyle(lineWidth: max(1, lineWidth * 0.8), lineCap: .round))
 
         case .voltageSource, .currentSource, .vcvs, .ccvs, .vccs, .cccs:
             // Independent sources are circles, controlled sources diamonds.
@@ -343,7 +441,19 @@ struct ToolIcon: View {
             SymbolRenderer.drawComponent(kind, from: CGPoint(x: x, y: 190), to: CGPoint(x: x, y: 130), unit: unit, color: color, lineWidth: 2, in: context)
         }
         SymbolRenderer.drawGround(at: CGPoint(x: 260, y: 60), direction: CGPoint(x: 1, y: 0), unit: unit, color: color, lineWidth: 2, in: context)
+        for (index, kind) in [ComponentKind.capacitor, .inductor, .signalGenerator].enumerated() {
+            let x = 20 + CGFloat(index) * 100
+            SymbolRenderer.drawComponent(kind, from: CGPoint(x: x, y: 240), to: CGPoint(x: x + 80, y: 240), unit: unit, color: color, lineWidth: 2, in: context)
+            SymbolRenderer.drawComponent(kind, from: CGPoint(x: x + 40, y: 340), to: CGPoint(x: x + 40, y: 270), unit: unit, color: color, lineWidth: 2, in: context)
+        }
+        for (index, closed) in [false, true].enumerated() {
+            let y = 380 + CGFloat(index) * 50
+            SymbolRenderer.drawComponent(.toggleSwitch, from: CGPoint(x: 20, y: y), to: CGPoint(x: 100, y: y), unit: unit, color: color, lineWidth: 2, isClosed: closed, in: context)
+            SymbolRenderer.drawComponent(.pushButton, from: CGPoint(x: 140, y: y), to: CGPoint(x: 220, y: y), unit: unit, color: color, lineWidth: 2, isClosed: closed, in: context)
+            SymbolRenderer.drawComponent(.pushButton, from: CGPoint(x: 240, y: y), to: CGPoint(x: 310, y: y), unit: unit, color: color, lineWidth: 2, isClosed: !closed, isNormallyClosed: true, in: context)
+        }
+        SymbolRenderer.drawComponent(.signalGenerator, from: CGPoint(x: 180, y: 110), to: CGPoint(x: 260, y: 110), unit: unit, color: color, lineWidth: 2, waveform: .square, in: context)
     }
-    .frame(width: 320, height: 210)
+    .frame(width: 320, height: 460)
     .background(Color(red: 0.957, green: 0.953, blue: 0.937))
 }

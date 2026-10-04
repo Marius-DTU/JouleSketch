@@ -28,6 +28,21 @@ import Foundation
 /// ```
 nonisolated enum MapleExporter {
     static func export(_ circuit: Circuit) -> String {
+        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches())
+        if !lowSide.isEmpty {
+            let notes = lowSide.map { "# \($0.name) er en low-side udgang (LSO): et firkantsignal fra 0 V til \($0.openVoltage.map { SIValue.format($0, unit: "V") } ?? "?") (spændingen over den, når den er åben)" }
+            return (notes + [export(circuit)]).joined(separator: "\n")
+        }
+        if circuit.usesFourier {
+            // Two scripts: the averages, then the fundamental with phasors.
+            let average = circuit.averageCircuit()
+            let solution = CircuitSolver.solve(average)
+            var writer = Writer(circuit: average)
+            var fundamental = Writer(circuit: circuit.fundamentalCircuit(componentValues: solution.componentValues))
+            return ["# Del 1: middelværdier (signalets middelværdi, kondensatorer afbrudt, spoler kortsluttet)", writer.build(),
+                    "", "# Del 2: grundtonen (signalets første Fourier-led), andre kilder slukket",
+                    fundamental.build()].joined(separator: "\n")
+        }
         var writer = Writer(circuit: circuit)
         return writer.build()
     }
@@ -45,13 +60,17 @@ nonisolated enum MapleExporter {
     /// Significant digits for `evalf(x, n)`.
     static func significantDigits(for value: Double?) -> Int { Writer.significantDigits(for: value) }
 
-    /// Maple units with SI prefixes, largest first, for "V", "A" and "ohm".
+    /// Maple units with SI prefixes, largest first, for "V", "A", "ohm",
+    /// "F", "H" and "Hz".
     /// Maple writes Ω and µ inside names as `&Omega;` and `&mu;`, so the
     /// backquoted name `k&Omega;` is kΩ.
     private static let prefixedUnits: [String: [(factor: Double, unit: String)]] = [
         "V": [(1e3, "kV"), (1, "V"), (1e-3, "mV"), (1e-6, "`&mu;V`")],
         "A": [(1, "A"), (1e-3, "mA"), (1e-6, "`&mu;A`"), (1e-9, "nA")],
         "ohm": [(1e6, "`M&Omega;`"), (1e3, "`k&Omega;`"), (1, "`&Omega;`")],
+        "F": [(1, "F"), (1e-3, "mF"), (1e-6, "`&mu;F`"), (1e-9, "nF"), (1e-12, "pF")],
+        "H": [(1, "H"), (1e-3, "mH"), (1e-6, "`&mu;H`")],
+        "Hz": [(1e6, "MHz"), (1e3, "kHz"), (1, "Hz")],
     ]
 
     /// The unit with the prefix that suits a value, and the value in it:
@@ -74,9 +93,10 @@ nonisolated enum MapleExporter {
 nonisolated private struct Writer {
     /// What kind of quantity a Maple name holds, for its unit and the final listing.
     enum Quantity: Int, Comparable {
-        case voltage, resistance, sourceVoltage, sourceCurrent, current
+        case voltage, resistance, capacitance, inductance, sourceVoltage, sourceCurrent, current
         /// Gains of controlled sources: μ (V/V), r (V/A), g (A/V) and β (A/A).
         case voltageGain, transresistance, transconductance, currentGain
+        case frequency
 
         /// The unit, before an SI prefix is chosen (`MapleExporter.prefixed`),
         /// or `nil` for gains without one.
@@ -84,6 +104,9 @@ nonisolated private struct Writer {
             switch self {
             case .voltage, .sourceVoltage: "V"
             case .resistance, .transresistance: "ohm"
+            case .capacitance: "F"
+            case .inductance: "H"
+            case .frequency: "Hz"
             case .sourceCurrent, .current: "A"
             case .transconductance, .voltageGain, .currentGain: nil
             }
@@ -109,6 +132,8 @@ nonisolated private struct Writer {
     var lines: [String] = []
     /// The app's own solution, which also tells which diodes conduct.
     let solution: CircuitSolution
+    /// The Maple name of the angular frequency ω in AC, `nil` in DC.
+    var omegaName: String?
 
     init(circuit: Circuit) {
         self.circuit = circuit
@@ -118,10 +143,12 @@ nonisolated private struct Writer {
 
     // MARK: Diodes
 
-    /// Whether a component sets the voltage across it: a voltage source, or a
-    /// conducting diode (its forward voltage). A blocking diode carries no current.
+    /// Whether a component sets the voltage across it: a voltage source, a
+    /// conducting diode (its forward voltage), or an inductor in DC (0 V).
+    /// A blocking diode carries no current.
     private func setsVoltage(_ component: CircuitComponent) -> Bool {
         component.kind.setsVoltage || (component.kind.isDiode && conducts(component))
+            || (component.kind == .inductor && omegaName == nil)
     }
 
     private func conducts(_ component: CircuitComponent) -> Bool {
@@ -231,8 +258,12 @@ nonisolated private struct Writer {
         return nodeNames[node].map { assigned.contains($0) } ?? false
     }
 
+    /// The 0 V an inductor sets in DC.
+    private static let zeroVolts = "0*Unit('V')"
+
     /// `a − b` or `a + b`, leaving out a zero `a`.
     private func combine(_ a: String, _ sign: String, _ b: String) -> String {
+        if b == Writer.zeroVolts { return a == "0" ? b : a }
         if a == "0" { return sign == "+" ? b : "-\(b)" }
         return "\(a) \(sign) \(b)"
     }
@@ -251,23 +282,56 @@ nonisolated private struct Writer {
     }
 
     /// What a source sets: `S1` for an independent source, `S3*(VA - VB)`
-    /// (gain times control) for a controlled one.
+    /// (gain times control) for a controlled one, and `S1*exp(30*I*Pi/180)`
+    /// for a signal generator with a phase.
     private func sourceValue(_ component: CircuitComponent) -> String {
+        if component.kind == .inductor { return Writer.zeroVolts }
+        if component.kind == .signalGenerator, let phase = Writer.phaseFactor(component) {
+            return "\(name(of: component))*\(phase)"
+        }
         guard component.kind.isDependent, let control = control(of: component) else { return name(of: component) }
         return "\(name(of: component))*\(control)"
+    }
+
+    /// A signal generator's phase as `exp(30*I*Pi/180)`, `nil` for 0°.
+    static func phaseFactor(_ component: CircuitComponent) -> String? {
+        guard let phase = component.phase, phase != 0 else { return nil }
+        return "exp(\(number(phase))*I*Pi/180)"
+    }
+
+    /// The current through a resistor, capacitor or inductor from a voltage
+    /// across it: `(VA - VB)/R1`, `(VA - VB)*I*omega*C1`, `(VA - VB)/(I*omega*L1)`.
+    private func passiveCurrent(_ component: CircuitComponent, across: String) -> String {
+        let value = name(of: component)
+        switch component.kind {
+        case .capacitor:
+            guard let omegaName else { return "0" }
+            return "(\(across))*I*\(omegaName)*\(value)"
+        case .inductor:
+            guard let omegaName else { return "0" }
+            return "(\(across))/(I*\(omegaName)*\(value))"
+        default:
+            return "(\(across))/\(value)"
+        }
     }
 
     /// The current through a component, from its start to its end terminal.
     private func current(of component: CircuitComponent) -> (sign: Double, term: String) {
         switch component.kind {
-        case .resistor:
+        case .resistor, .capacitor, .inductor:
+            // In DC a capacitor carries no current; an inductor is a short.
+            if omegaName == nil, component.kind == .capacitor { return (1, "0") }
+            if omegaName == nil, component.kind == .inductor { return sourceCurrent(component) }
             let from = voltage(at: component.start)
             let to = voltage(at: component.end)
-            return (1, "(\(from) - \(to))/\(name(of: component))")
-        case .voltageSource, .vcvs, .ccvs:
+            return (1, passiveCurrent(component, across: "\(from) - \(to)"))
+        case .voltageSource, .signalGenerator, .vcvs, .ccvs:
             return sourceCurrent(component)
         case .currentSource, .vccs, .cccs:
             return (1, sourceValue(component))
+        case .toggleSwitch, .pushButton:
+            // Switches are resolved into wires before writing.
+            return (1, "0")
         case .diode, .led:
             // A blocking diode carries no current.
             return conducts(component) ? sourceCurrent(component) : (1, "0")
@@ -324,6 +388,12 @@ nonisolated private struct Writer {
         for component in circuit.components { usedNames.insert(name(of: component)) }
         for probe in circuit.probes { usedNames.insert(Writer.mapleName(probe.name)) }
         for arrow in circuit.currents { usedNames.insert(Writer.mapleName(arrow.name)) }
+        // AC: phasors at the angular frequency ω = 2πf of the signal generators.
+        var frequencyName: String?
+        if circuit.isAC {
+            frequencyName = uniqueName("f")
+            omegaName = uniqueName("omega")
+        }
         for component in circuit.components where setsVoltage(component) {
             usedNames.insert(sourceCurrentName(component))
         }
@@ -408,7 +478,10 @@ nonisolated private struct Writer {
             case .ccvs: .transresistance
             case .vccs: .transconductance
             case .cccs: .currentGain
-            case .diode, .led: .sourceVoltage
+            case .diode, .led, .signalGenerator: .sourceVoltage
+            case .capacitor: .capacitance
+            case .inductor: .inductance
+            case .toggleSwitch, .pushButton: .current
             }
             if setsVoltage(component), sourceCurrentArrows[component.id] == nil {
                 quantities[sourceCurrentName(component)] = .current
@@ -430,6 +503,15 @@ nonisolated private struct Writer {
         }
         for arrow in circuit.currents {
             if let value = arrow.value { assign(Writer.mapleName(arrow.name), value, as: .current) }
+        }
+        if let frequencyName, let omegaName {
+            lines.append("")
+            lines.append("# Fasorer (AC) ved signalgeneratorens frekvens: Z_C = 1/(I*omega*C), Z_L = I*omega*L")
+            if case .success(let frequency) = circuit.acFrequency() {
+                assign(frequencyName, frequency, as: .frequency)
+            }
+            lines.append("\(omegaName) := 2*Pi*\(frequencyName):")
+            assigned.insert(omegaName)
         }
 
         // Vs of voltage-controlled sources, before the lines that use it.
@@ -519,16 +601,22 @@ nonisolated private struct Writer {
         where node != netlist.groundNode {
             guard let nodeName = nodeNames[node] else { continue }
             var terms: [(Double, String)] = []
-            // Resistors first, then sources, e.g. (VA - VB)/R2 - I1 = 0.
-            let ordered = circuit.components.filter { $0.kind == .resistor } + circuit.components.filter { $0.kind != .resistor }
+            // Resistors first, then sources, e.g. (VA - VB)/R2 - I1 = 0. In AC
+            // capacitors and inductors count like resistors, with their impedance.
+            func isPassive(_ component: CircuitComponent) -> Bool {
+                component.kind == .resistor || (component.kind.isReactive && omegaName != nil)
+            }
+            let ordered = circuit.components.filter(isPassive) + circuit.components.filter { !isPassive($0) }
             for component in ordered {
                 let atStart = netlist.nodeOf[component.start] == node
                 let atEnd = netlist.nodeOf[component.end] == node
                 guard atStart != atEnd else { continue }
-                switch component.kind {
-                case .resistor:
+                if isPassive(component) {
                     let other = voltage(at: atStart ? component.end : component.start)
-                    terms.append((1, "(\(nodeName) - \(other))/\(name(of: component))"))
+                    terms.append((1, passiveCurrent(component, across: "\(nodeName) - \(other)")))
+                    continue
+                }
+                switch component.kind {
                 default:
                     let flow = current(of: component)
                     terms.append((atStart ? flow.sign : -flow.sign, flow.term))
@@ -562,8 +650,11 @@ nonisolated private struct Writer {
         // Everything without a value is solved for.
         var unknowns: [String] = []
         unknowns += nodesWithComponents.compactMap { nodeNames[$0] }
-        // A blocking diode's forward voltage doesn't take part.
-        unknowns += circuit.components.filter { $0.value == nil && (!$0.kind.isDiode || conducts($0)) }.map(name(of:))
+        // A blocking diode's forward voltage doesn't take part, nor does a
+        // capacitance or inductance in DC.
+        unknowns += circuit.components.filter {
+            $0.value == nil && (!$0.kind.isDiode || conducts($0)) && (!$0.kind.isReactive || omegaName != nil)
+        }.map(name(of:))
         unknowns += circuit.components.filter { setsVoltage($0) && sourceCurrentArrows[$0.id] == nil }.map(sourceCurrentName)
         unknowns += sourceCurrentArrows.values.map(\.name)
         unknowns += arrowExpressions.map(\.name)
@@ -615,6 +706,10 @@ nonisolated private struct Writer {
                 if let base = quantity.baseUnit {
                     let unit = MapleExporter.prefixed(computedValues[name], base: base).unit
                     lines.append("\(name) := evalf(convert(\(name), 'units', '\(unit)'), \(digits));")
+                    if omegaName != nil, quantity == .voltage || quantity == .current {
+                        // A phasor: its amplitude and its phase in degrees.
+                        lines.append("evalf(abs(\(name)/Unit('\(unit)')), \(digits))*Unit('\(unit)'), evalf(argument(\(name)/Unit('\(unit)'))*180/Pi, 4);")
+                    }
                 } else {
                     lines.append("\(name) := evalf(\(name), \(digits));")
                 }

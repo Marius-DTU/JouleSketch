@@ -45,6 +45,7 @@ nonisolated struct LatexParser {
     private static let operators: [String: String] = [
         "cdot": "·", "times": "×", "div": "÷", "pm": "±", "approx": "≈", "neq": "≠",
         "leq": "≤", "geq": "≥", "to": "→", "infty": "∞", "Rightarrow": "⇒", "checkmark": "✓",
+        "angle": "∠", "circ": "°", "ldots": "…",
     ]
 
     static func parse(_ latex: String) -> MathRow {

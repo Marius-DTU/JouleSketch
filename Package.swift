@@ -22,6 +22,7 @@ let sharedFiles = [
     "NodalWalkthrough.swift",
     "SchematicScene.swift",
     "SheetInteraction.swift",
+    "UserGuide.swift",
     "Walkthrough.swift",
 ].map { "JouleSketch/\($0)" }
 

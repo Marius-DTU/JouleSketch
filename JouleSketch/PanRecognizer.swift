@@ -49,7 +49,33 @@ struct PanRecognizer {
     }
 }
 
+/// A click with the right (secondary) mouse button, without dragging. On
+/// iPad it's a secondary click with a mouse or trackpad.
+struct SecondaryClickRecognizer {
+    /// Called with where the click happened (local coordinates).
+    let onClick: (CGPoint) -> Void
+}
+
 extension View {
+    /// Adds the right-click recognizer where SwiftUI supports gesture
+    /// recognizer representables.
+    @ViewBuilder
+    func secondaryClickGesture(_ recognizer: SecondaryClickRecognizer) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            gesture(recognizer)
+        } else {
+            self
+        }
+        #else
+        if #available(iOS 18.0, *) {
+            gesture(recognizer)
+        } else {
+            self
+        }
+        #endif
+    }
+
     /// Adds the pan recognizer where SwiftUI supports gesture recognizer
     /// representables; older systems pan with the trackpad or pinch instead.
     @ViewBuilder
@@ -103,6 +129,20 @@ extension PanRecognizer: NSGestureRecognizerRepresentable {
             location: context.converter.location(in: .local),
             coordinator: context.coordinator
         )
+    }
+}
+
+extension SecondaryClickRecognizer: NSGestureRecognizerRepresentable {
+    func makeNSGestureRecognizer(context: Context) -> NSClickGestureRecognizer {
+        let recognizer = NSClickGestureRecognizer()
+        // Bit 1 is the right mouse button.
+        recognizer.buttonMask = 0x2
+        return recognizer
+    }
+
+    func handleNSGestureRecognizerAction(_ recognizer: NSClickGestureRecognizer, context: Context) {
+        guard recognizer.state == .ended else { return }
+        onClick(context.converter.location(in: .local))
     }
 }
 
@@ -196,6 +236,19 @@ extension PanRecognizer: UIGestureRecognizerRepresentable {
             location: context.converter.location(in: .local),
             coordinator: context.coordinator
         )
+    }
+}
+
+extension SecondaryClickRecognizer: UIGestureRecognizerRepresentable {
+    func makeUIGestureRecognizer(context: Context) -> UITapGestureRecognizer {
+        let recognizer = UITapGestureRecognizer()
+        recognizer.buttonMaskRequired = .secondary
+        return recognizer
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UITapGestureRecognizer, context: Context) {
+        guard recognizer.state == .ended else { return }
+        onClick(context.converter.location(in: .local))
     }
 }
 

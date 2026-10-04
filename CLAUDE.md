@@ -24,6 +24,8 @@ The web version compiles the shared Swift files listed in `Package.swift`
 - New bridge functions go in `Web/Bridge/main.swift` (`@JS`), and their
   signatures in the `JouleApp` interface at the top of `main.ts`.
 - New shortcuts are `KeyAction`s (rebindable in settings) in both versions.
+- Keep the in-app guide (`UserGuide.swift`, shared) up to date: new tools,
+  features and shortcuts must be described there in the same change.
 
 ## Checking
 

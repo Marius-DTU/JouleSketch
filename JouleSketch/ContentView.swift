@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showSolverReport = false
     @State private var showMapleExport = false
+    @State private var showGuide = false
     @State private var canvasSize: CGSize = .zero
     /// Space between the tool palette and the window's sides.
     private static let paletteMargin: CGFloat = 16
@@ -100,6 +101,9 @@ struct ContentView: View {
             }
             // The palette tells the sheet where it is, in the sheet's coordinates.
             .coordinateSpace(.named(ToolPalette.sheetSpace))
+            .sheet(isPresented: $showGuide) {
+                UserGuideView()
+            }
     }
 
     private var canvasCenter: CGPoint {
@@ -187,6 +191,9 @@ struct ContentView: View {
                     editor.clearAll()
                 }
                 Divider()
+                Button("Sådan bruger du JouleSketch", systemImage: "info.circle") {
+                    showGuide = true
+                }
                 #if os(macOS)
                 SettingsLink {
                     Label("Indstillinger…", systemImage: "gearshape")

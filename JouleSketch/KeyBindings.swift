@@ -6,9 +6,14 @@ import Foundation
 enum KeyAction: String, CaseIterable, Identifiable, Codable {
     case select
     case wire
+    case toggleSwitch
+    case pushButton
     case resistor
+    case capacitor
+    case inductor
     case voltageSource
     case currentSource
+    case signalGenerator
     case diode
     case led
     case ground
@@ -63,9 +68,14 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .select: .select
         case .wire: .wire
+        case .toggleSwitch: .component(.toggleSwitch)
+        case .pushButton: .component(.pushButton)
         case .resistor: .component(.resistor)
+        case .capacitor: .component(.capacitor)
+        case .inductor: .component(.inductor)
         case .voltageSource: .component(.voltageSource)
         case .currentSource: .component(.currentSource)
+        case .signalGenerator: .component(.signalGenerator)
         case .diode: .component(.diode)
         case .led: .component(.led)
         case .ground: .ground
@@ -84,9 +94,14 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .select: "s"
         case .wire: "w"
+        case .toggleSwitch: "x"
+        case .pushButton: "b"
         case .resistor: "1"
+        case .capacitor: "c"
+        case .inductor: "l"
         case .voltageSource: "2"
         case .currentSource: "3"
+        case .signalGenerator: "6"
         case .diode: "4"
         case .led: "5"
         case .ground: "g"

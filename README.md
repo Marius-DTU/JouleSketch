@@ -16,12 +16,16 @@ Der er to versioner, som bygger på den samme kode:
 ## Funktioner
 
 ### Tegning
-- **Komponenter:** modstand, spændingskilde, strømkilde, diode, lysdiode (LED)
-  og de fire styrede kilder (spændingsstyret og strømstyret spændings- og
+- **Komponenter:** modstand, kondensator, spole, spændingskilde, strømkilde,
+  signalgenerator, kontakt, trykknap, diode, lysdiode (LED) og de fire styrede kilder (spændingsstyret og strømstyret spændings- og
   strømkilde).
 - **Ledninger** med støttepunkter. Komponenter kan placeres med et klik eller
   trækkes ud mellem to punkter, så retning og placering kommer med med det
   samme.
+- **Kontakter og trykknapper:** klik på en kontakt med Vælg-værktøjet for at
+  åbne eller lukke den; en trykknap er lukket, mens man holder den nede
+  (eller åben, hvis den er sat til normalt lukket, NC).
+  Beregningen følger med med det samme.
 - **Stel** (0 V), **strømpile** på ledninger, **spændingspunkter** og
   **spændingsfald** mellem to punkter.
 - **Maskestrømme**, der vises inde i en maske, med eller mod uret.
@@ -32,12 +36,23 @@ Der er to versioner, som bygger på den samme kode:
   udregnes med enheder.
 - **Grupper**, der deler et større kredsløb op i dele i Maple-vinduet.
 - Fortryd, kopiér/indsæt, flyt, rotér og markér hele ledninger.
-- **Symboleditor** til komponenternes værdier, og farvekoder for modstande
+- **Symboleditor** (dobbeltklik eller højreklik på et symbol) til komponenternes værdier, og farvekoder for modstande
   (E-rækkerne efter IEC 60063).
 
 ### Beregning
 - Løser kredsløbet ud fra de kendte værdier og finder ukendte spændinger,
   strømme, effekter og komponentværdier.
+- Med en **signalgenerator** (amplitude, frekvens og fase) regnes kredsløbet
+  med fasorer: kondensatorer og spoler får deres impedans, og spændinger og
+  strømme vises som amplitude ∠ fase. Uden en signalgenerator regnes der DC,
+  hvor en kondensator er en afbrydelse og en spole en kortslutning.
+- Signalgeneratoren har en **bølgeform**: sinus eller firkant (PWM med duty
+  cycle). Andet end en sinus regnes som middelværdi (fx D · højspænding) og
+  grundtone (første Fourier-led, for en firkant (2A/π)·sin(πD)) med fasorer,
+  så man kan se, hvor meget der er tilbage af signalet efter fx et RC-filter.
+  En firkant sat til 0 V er en **low-side udgang (LSO)**: åben (høj) i duty
+  cyclen og trukket til stel resten af perioden, trukket op af resten af
+  kredsløbet (fx en pull-up-modstand).
 - Dioder og lysdioder regnes med en fast spænding (0,7 V og 2 V som
   standard), og programmet finder selv ud af, om de leder eller spærrer.
 - En **beregningsrapport** fortæller, hvad der mangler, og om de kendte
@@ -88,6 +103,9 @@ Alle genveje kan ændres under **Indstillinger**. Standard er:
 | `3` | Strømkilde | `M` | Maskestrøm |
 | `4` | Diode | `T` | Tekstfelt |
 | `5` | Lysdiode | `K` | Gruppe |
+| `C` | Kondensator | `L` | Spole |
+| `6` | Signalgenerator | `X` | Kontakt |
+| `B` | Trykknap | | |
 | `G` | Stel | `R` | Rotér / vend retning |
 | `U` | Markér hele ledningen | `Esc` | Afslut / tilbage til Vælg |
 

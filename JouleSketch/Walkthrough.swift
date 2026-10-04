@@ -74,6 +74,30 @@ nonisolated enum WalkFormat {
         value < 0 ? "(\(number(value)))" : number(value)
     }
 
+    /// Whether a complex number is shown as a real one: its imaginary part is
+    /// negligible next to its size (always so in DC).
+    static func isReal(_ value: Complex) -> Bool {
+        abs(value.im) <= 1e-9 * max(value.magnitude, 1e-300) || abs(value.im) < 1e-12
+    }
+
+    /// A complex number with j for the imaginary unit: "3 - j4", "j159,2",
+    /// "-j2". Real numbers look like `number`.
+    static func number(_ value: Complex) -> String {
+        if isReal(value) { return number(value.re) }
+        let imaginary = "j" + number(abs(value.im))
+        if abs(value.re) <= 1e-9 * value.magnitude {
+            return (value.im < 0 ? "-" : "") + imaginary
+        }
+        return "\(number(value.re)) \(value.im < 0 ? "-" : "+") \(imaginary)"
+    }
+
+    /// A complex number in brackets when it has two parts or is negative.
+    static func factor(_ value: Complex) -> String {
+        if isReal(value) { return factor(value.re) }
+        if abs(value.re) <= 1e-9 * value.magnitude, value.im > 0 { return number(value) }
+        return "(\(number(value)))"
+    }
+
     /// A value with unit and SI prefix, e.g. "4 [[mA]]".
     static func quantity(_ value: Double, _ unit: PhysicalUnit) -> String {
         MathEvaluator.latex(for: Quantity(abs(value) < 1e-12 ? 0 : value, unit: unit))
@@ -82,6 +106,60 @@ nonisolated enum WalkFormat {
     /// A value with unit, in brackets when it's negative: "(-9 [[V]])".
     static func quantityFactor(_ value: Double, _ unit: PhysicalUnit) -> String {
         value < -1e-12 ? "(\(quantity(value, unit)))" : quantity(value, unit)
+    }
+
+    /// A complex value with unit and an SI prefix from its size:
+    /// "(3 - j4) [[mA]]". Real values look like `quantity`.
+    static func quantity(_ value: Complex, _ unit: PhysicalUnit) -> String {
+        if isReal(value) { return quantity(value.re, unit) }
+        return complexQuantity(value, symbol: unit.symbol)
+    }
+
+    /// A complex value with unit, in brackets when it's negative or complex.
+    static func quantityFactor(_ value: Complex, _ unit: PhysicalUnit) -> String {
+        if isReal(value) { return quantityFactor(value.re, unit) }
+        let text = quantity(value, unit)
+        return text.hasPrefix("(") ? text : "(\(text))"
+    }
+
+    /// A value with a unit `PhysicalUnit` doesn't know (F, H, Hz), with an
+    /// SI prefix: "100 [[nF]]".
+    static func quantity(_ value: Double, symbol: String) -> String {
+        let (scaled, prefix) = prefixed(value)
+        return "\(number(scaled)) [[\(prefix)\(symbol)]]"
+    }
+
+    /// "(3 - j4) [[mA]]", with the prefix chosen from the size.
+    private static func complexQuantity(_ value: Complex, symbol: String) -> String {
+        let (_, prefix) = prefixed(value.magnitude)
+        let factor = value.magnitude == 0 ? 1 : value.magnitude / prefixed(value.magnitude).value
+        let scaled = value / factor
+        let body = number(scaled)
+        // Brackets hold a number with both a real and an imaginary part together.
+        let bracketed = body.contains(" ") ? "(\(body))" : body
+        return symbol.isEmpty ? bracketed : "\(bracketed) [[\(prefix)\(symbol)]]"
+    }
+
+    /// A value scaled to an SI prefix: 0,0001 → (100, "µ").
+    private static func prefixed(_ value: Double) -> (value: Double, prefix: String) {
+        let prefixes: [Int: String] = [-12: "p", -9: "n", -6: "µ", -3: "m", 0: "", 3: "k", 6: "M", 9: "G", 12: "T"]
+        let magnitude = abs(value)
+        var exponent = magnitude == 0 ? 0 : Int(floor(log10(magnitude * 1.000_000_1) / 3)) * 3
+        exponent = min(12, max(-12, exponent))
+        return (value / pow(10, Double(exponent)), prefixes[exponent] ?? "")
+    }
+
+    /// A phasor as amplitude and phase: "5 [[V]] \\angle -53,1^{\\circ}".
+    static func phasor(_ value: Complex, _ unit: PhysicalUnit) -> String {
+        let degrees = value.magnitude < 1e-15 ? 0 : value.degrees
+        let rounded = (degrees * 10).rounded() / 10
+        return "\(quantity(value.magnitude, unit)) \\angle \(number(rounded == 0 ? 0 : rounded))^{\\circ}"
+    }
+
+    /// A result: "3 - j4 [[V]] = 5 [[V]] ∠ -53,1°" when complex, otherwise
+    /// just the value with its unit.
+    static func result(_ value: Complex, _ unit: PhysicalUnit) -> String {
+        isReal(value) ? quantity(value.re, unit) : "\(quantity(value, unit)) = \(phasor(value, unit))"
     }
 
     /// A, B, …, Z, then A1, B1, … for naming nodes and meshes.
@@ -101,32 +179,56 @@ nonisolated enum WalkFormat {
         latex.filter { !"_{}".contains($0) }
     }
 
-    /// Terms like "2 x - y + 3", in the order of `order`.
-    static func combination(_ terms: [String: Double], constant: Double = 0, order: [String]) -> String {
+    /// Terms like "2 x - y + 3", in the order of `order`. Complex
+    /// coefficients are written in brackets: "(1 - j2) x".
+    static func combination(_ terms: [String: Complex], constant: Complex = .zero, order: [String]) -> String {
+        /// The sign and the rest of a term with this coefficient.
+        func signed(_ coefficient: Complex) -> (negative: Bool, size: Complex) {
+            if isReal(coefficient) { return (coefficient.re < 0, Complex(abs(coefficient.re))) }
+            if abs(coefficient.re) <= 1e-9 * coefficient.magnitude { return (coefficient.im < 0, Complex(0, abs(coefficient.im))) }
+            return (false, coefficient)
+        }
         var parts: [(negative: Bool, body: String)] = []
         for variable in order {
-            guard let coefficient = terms[variable], abs(coefficient) > 1e-12 else { continue }
-            let body = abs(abs(coefficient) - 1) < 1e-12 ? variable : "\(number(abs(coefficient))) \(variable)"
-            parts.append((coefficient < 0, body))
+            guard let coefficient = terms[variable], coefficient.magnitude > 1e-12 else { continue }
+            let (negative, size) = signed(coefficient)
+            let body = (size - .one).magnitude < 1e-12 ? variable : "\(factor(size)) \(variable)"
+            parts.append((negative, body))
         }
-        if abs(constant) > 1e-12 || parts.isEmpty {
-            parts.append((constant < 0, number(abs(constant))))
+        if constant.magnitude > 1e-12 || parts.isEmpty {
+            let (negative, size) = signed(constant)
+            parts.append((negative, factor(size)))
         }
         return parts.enumerated().map { index, part in
             index == 0 ? (part.negative ? "-" : "") + part.body : (part.negative ? " - " : " + ") + part.body
         }.joined()
+    }
+
+    /// Real terms like "2 x - y + 3", in the order of `order`.
+    static func combination(_ terms: [String: Double], constant: Double = 0, order: [String]) -> String {
+        combination(terms.mapValues { Complex($0) }, constant: Complex(constant), order: order)
     }
 }
 
 // MARK: - Linear equations and gradual substitution
 
 /// Σ coefficient · variable = constant, with variables named by their LaTeX.
+/// The coefficients are complex for AC circuits and real in DC.
 nonisolated struct LinearEquation {
-    var terms: [String: Double] = [:]
-    var constant: Double = 0
+    var terms: [String: Complex] = [:]
+    var constant: Complex = .zero
+
+    mutating func add(_ variable: String, _ coefficient: Complex) {
+        terms[variable, default: .zero] += coefficient
+    }
 
     mutating func add(_ variable: String, _ coefficient: Double) {
-        terms[variable, default: 0] += coefficient
+        add(variable, Complex(coefficient))
+    }
+
+    /// Drops terms that are 0.
+    mutating func removeZeros() {
+        terms = terms.filter { $0.value.magnitude > 1e-12 }
     }
 
     func latex(order: [String]) -> String {
@@ -141,26 +243,27 @@ nonisolated enum Substitution {
     /// solution.
     static func solve(
         _ equations: [(label: String, equation: LinearEquation)], unknowns: [String]
-    ) -> (lines: [WalkLine], values: [String: Double])? {
+    ) -> (lines: [WalkLine], values: [String: Complex])? {
         let epsilon = 1e-12
         var remaining = equations
-        var isolated: [(variable: String, terms: [String: Double], constant: Double)] = []
+        var isolated: [(variable: String, terms: [String: Complex], constant: Complex)] = []
         var lines: [WalkLine] = []
 
         var unsolved = unknowns
         while !unsolved.isEmpty {
             // The equation with the fewest unknowns, so values that can be read
             // off directly come first and are put in right away.
-            func count(_ index: Int) -> Int { remaining[index].equation.terms.values.filter { abs($0) > epsilon }.count }
-            let usable = remaining.indices.filter { index in unsolved.contains { abs(remaining[index].equation.terms[$0] ?? 0) > epsilon } }
+            func size(_ index: Int, _ variable: String) -> Double { remaining[index].equation.terms[variable]?.magnitude ?? 0 }
+            func count(_ index: Int) -> Int { remaining[index].equation.terms.values.filter { $0.magnitude > epsilon }.count }
+            let usable = remaining.indices.filter { index in unsolved.contains { size(index, $0) > epsilon } }
             guard let pick = usable.min(by: { count($0) < count($1) }),
-                  let variable = unsolved.first(where: { abs(remaining[pick].equation.terms[$0] ?? 0) > epsilon })
+                  let variable = unsolved.first(where: { size(pick, $0) > epsilon })
             else { return nil }
             unsolved.removeAll { $0 == variable }
             let (label, equation) = remaining.remove(at: pick)
-            let a = equation.terms[variable] ?? 1
-            var terms: [String: Double] = [:]
-            for (other, coefficient) in equation.terms where other != variable && abs(coefficient) > epsilon {
+            let a = equation.terms[variable] ?? .one
+            var terms: [String: Complex] = [:]
+            for (other, coefficient) in equation.terms where other != variable && coefficient.magnitude > epsilon {
                 terms[other] = -coefficient / a
             }
             let constant = equation.constant / a
@@ -169,12 +272,12 @@ nonisolated enum Substitution {
             lines.append(.math("\(variable) = \(WalkFormat.combination(terms, constant: constant, order: unknowns))"))
 
             for index in remaining.indices {
-                let c = remaining[index].equation.terms[variable] ?? 0
-                guard abs(c) > epsilon else { continue }
+                let c = remaining[index].equation.terms[variable] ?? .zero
+                guard c.magnitude > epsilon else { continue }
                 remaining[index].equation.terms[variable] = nil
                 for (other, k) in terms { remaining[index].equation.add(other, c * k) }
                 remaining[index].equation.constant -= c * constant
-                remaining[index].equation.terms = remaining[index].equation.terms.filter { abs($0.value) > epsilon }
+                remaining[index].equation.removeZeros()
                 lines.append(.text("Indsæt i (\(remaining[index].label)):"))
                 lines.append(.math(remaining[index].equation.latex(order: unknowns)))
             }
@@ -182,22 +285,26 @@ nonisolated enum Substitution {
         }
 
         // Back through the isolated unknowns, last first.
-        var values: [String: Double] = [:]
+        var values: [String: Complex] = [:]
         var back: [WalkLine] = []
         for (variable, terms, constant) in isolated.reversed() {
             var value = constant
             var inserted: [String] = []
             for other in unknowns where terms[other] != nil {
-                let k = terms[other] ?? 0
-                let known = values[other] ?? 0
+                let k = terms[other] ?? .zero
+                let known = values[other] ?? .zero
                 value += k * known
-                inserted.append("\(k < 0 ? "-" : "+") \(WalkFormat.number(abs(k))) \\cdot \(WalkFormat.factor(known))")
+                if WalkFormat.isReal(k) {
+                    inserted.append("\(k.re < 0 ? "-" : "+") \(WalkFormat.number(abs(k.re))) \\cdot \(WalkFormat.factor(known))")
+                } else {
+                    inserted.append("+ \(WalkFormat.factor(k)) \\cdot \(WalkFormat.factor(known))")
+                }
             }
             values[variable] = value
             if inserted.isEmpty {
                 back.append(.math("\(variable) = \(WalkFormat.number(value))"))
             } else {
-                let start = abs(constant) > epsilon ? WalkFormat.number(constant) + " " : ""
+                let start = constant.magnitude > epsilon ? WalkFormat.number(constant) + " " : ""
                 var expression = start + inserted.joined(separator: " ")
                 if start.isEmpty, expression.hasPrefix("+ ") { expression.removeFirst(2) }
                 back.append(.math("\(variable) = \(expression) = \(WalkFormat.number(value))"))
@@ -270,7 +377,24 @@ nonisolated struct WalkPart {
 
     /// Voltage and current sources that aren't controlled, the ones
     /// superposition switches off.
-    var isIndependent: Bool { kind == .voltageSource || kind == .currentSource }
+    var isIndependent: Bool { kind.isIndependentSource }
+
+    /// Resistors, capacitors and inductors: Ohm's law with their impedance.
+    var isPassive: Bool { kind == .resistor || kind.isReactive }
+
+    /// The symbol of a passive part's impedance: R_{1}, or Z_{C1} for a
+    /// capacitor or inductor.
+    var impedanceSymbol: String { kind == .resistor ? symbol : "Z_{\(component.name)}" }
+
+    /// An independent source's value as a phasor, with a signal generator's phase.
+    var phasor: Complex { Complex(value) * component.phaseFactor }
+
+    /// The Maple expression of a source's value: S1, or S1*exp(30*I*Pi/180)
+    /// for a signal generator with a phase.
+    var mapleValue: String {
+        guard kind == .signalGenerator, let phase = component.phase, phase != 0 else { return mapleName }
+        return "\(mapleName)*exp(\(MapleExporter.number(phase))*I*Pi/180)"
+    }
 }
 
 /// What a controlled source depends on: the voltage between two nodes (Vs)
@@ -304,6 +428,19 @@ nonisolated struct WalkModel {
     let targets: [WalkTarget]
     /// What each controlled source depends on, by source id.
     let controls: [UUID: WalkControl]
+    /// The frequency and angular frequency 2πf when the circuit is worked
+    /// out with phasors (AC); `nil` in DC.
+    let frequency: Double?
+    var omega: Double? { frequency.map { 2 * .pi * $0 } }
+    var isAC: Bool { frequency != nil }
+
+    /// A part's value in the equations: the impedance of a resistor,
+    /// capacitor or inductor, the phasor of an independent source, or the
+    /// gain of a controlled source.
+    func value(_ part: WalkPart) -> Complex {
+        if part.isPassive { return part.kind.impedance(part.value, omega: omega) }
+        return part.isIndependent ? part.phasor : Complex(part.value)
+    }
 
     /// The independent sources.
     var sources: [WalkPart] { parts.filter(\.isIndependent) }
@@ -321,12 +458,25 @@ nonisolated struct WalkModel {
         if let short = circuit.components.first(where: { $0.kind == .resistor && ($0.value ?? 0) <= 0 }) {
             return .failure(.message("\(short.name) er 0 Ω. Erstat den med en ledning."))
         }
+        if let short = circuit.components.first(where: { $0.kind == .inductor && ($0.value ?? 0) <= 0 }) {
+            return .failure(.message("\(short.name) er 0 H. Erstat den med en ledning."))
+        }
+        if let open = circuit.components.first(where: { $0.kind == .capacitor && ($0.value ?? 0) <= 0 }) {
+            return .failure(.message("\(open.name) er 0 F, så der løber ingen strøm. Fjern den."))
+        }
+        var frequency: Double?
+        if circuit.isAC {
+            switch circuit.acFrequency() {
+            case .success(let value): frequency = value
+            case .failure(let issue): return .failure(.message(issue.detail))
+            }
+        }
         var parts: [WalkPart] = []
         for component in circuit.components {
             guard let start = netlist.nodeOf[component.start], let end = netlist.nodeOf[component.end] else { continue }
             parts.append(WalkPart(component: component, start: start, end: end))
         }
-        guard parts.contains(where: { $0.component.kind != .resistor }) else {
+        guard parts.contains(where: { !$0.isPassive }) else {
             return .failure(.message("Kredsløbet har ingen kilder, så alle spændinger og strømme er 0."))
         }
 
@@ -420,21 +570,41 @@ nonisolated struct WalkModel {
         return .success(WalkModel(
             circuit: circuit, netlist: netlist, parts: parts, reference: reference,
             referenceIsGround: referenceIsGround, nodes: nodes, nodeName: nodeName, targets: targets,
-            controls: controls
+            controls: controls, frequency: frequency
         ))
     }
 
     /// "R_{1} = 1 [[kΩ]]" for each component, with what the sources are.
     func knownValueLines(_ parts: [WalkPart]? = nil) -> [WalkLine] {
         let parts = parts ?? self.parts
-        var lines: [WalkLine] = [.text("Kendte værdier:")]
+        var lines: [WalkLine] = []
+        if let frequency, let omega {
+            lines.append(.text("Kredsløbet regnes med fasorer ved signalgeneratorens frekvens. Kildernes værdier er amplituder; de andre kilder har fasen 0°."))
+            lines.append(.math("f = \(WalkFormat.quantity(frequency, symbol: "Hz"));\\quad \\omega = 2 \\pi f = \(WalkFormat.number(omega)) [[rad/s]]"))
+        }
+        lines.append(.text("Kendte værdier:"))
         lines += parts.map { part in
-            let unit = PhysicalUnit(symbol: part.kind.displayUnit) ?? .none
-            // Gains without a unit are written as plain numbers.
-            let value = unit == .none ? WalkFormat.number(part.value) : WalkFormat.quantity(part.value, unit)
+            let value: String
+            switch part.kind {
+            case .capacitor: value = WalkFormat.quantity(part.value, symbol: "F")
+            case .inductor: value = WalkFormat.quantity(part.value, symbol: "H")
+            case .signalGenerator: value = WalkFormat.isReal(part.phasor) ? WalkFormat.quantity(part.value, .volt) : WalkFormat.phasor(part.phasor, .volt)
+            default:
+                let unit = PhysicalUnit(symbol: part.kind.displayUnit) ?? .none
+                // Gains without a unit are written as plain numbers.
+                value = unit == .none ? WalkFormat.number(part.value) : WalkFormat.quantity(part.value, unit)
+            }
             return .math("\(part.valueSymbol) = \(value)")
         }
-        let voltageSources = parts.filter { $0.component.kind == .voltageSource }.map(\.component.name)
+        let reactive = parts.filter { $0.kind.isReactive }
+        if isAC, !reactive.isEmpty {
+            lines.append(.text("Impedanserne: en kondensator har Z = 1/(jωC), en spole Z = jωL."))
+            for part in reactive {
+                let formula = part.kind == .capacitor ? "\\frac{1}{j \\omega \(part.symbol)}" : "j \\omega \(part.symbol)"
+                lines.append(.math("\(part.impedanceSymbol) = \(formula) = \(WalkFormat.quantity(value(part), .ohm))"))
+            }
+        }
+        let voltageSources = parts.filter { $0.component.kind == .voltageSource || $0.component.kind == .signalGenerator }.map(\.component.name)
         let currentSources = parts.filter { $0.component.kind == .currentSource }.map(\.component.name)
         if !voltageSources.isEmpty {
             lines.append(.text("Spændingskilder: \(voltageSources.joined(separator: ", ")) (med + og − som på symbolet)."))
@@ -466,11 +636,17 @@ nonisolated struct WalkModel {
     /// node-voltage export, everything but the results ends with `:`.
     func mapleHeader() -> [String] {
         var lines = ["with(Units):", "unassign(anames(user)):", "", "# Kendte værdier"]
+        if let frequency {
+            lines.append("f := \(MapleExporter.quantity(frequency, base: "Hz")):")
+            lines.append("omega := 2*Pi*f:")
+        }
         for part in parts {
             let value = switch part.kind {
             case .resistor, .ccvs: MapleExporter.quantity(part.value, base: "ohm")
             case .currentSource: MapleExporter.quantity(part.value, base: "A")
-            case .voltageSource: MapleExporter.quantity(part.value, base: "V")
+            case .voltageSource, .signalGenerator: MapleExporter.quantity(part.value, base: "V")
+            case .capacitor: MapleExporter.quantity(part.value, base: "F")
+            case .inductor: MapleExporter.quantity(part.value, base: "H")
             case .vccs: "\(MapleExporter.number(part.value))*Unit('A'/'V')"
             default: MapleExporter.number(part.value)
             }
@@ -479,11 +655,38 @@ nonisolated struct WalkModel {
         return lines
     }
 
-    /// The only lines Maple prints: a target with its value in its unit.
-    static func mapleResult(_ target: WalkTarget, _ expression: String, value: Double?) -> String {
-        let digits = MapleExporter.significantDigits(for: value)
-        let unit = MapleExporter.prefixed(value, base: target.mapleUnit).unit
-        return "\(target.mapleName) := evalf(convert(\(expression), 'units', '\(unit)'), \(digits));"
+    /// The only lines Maple prints: a target with its value in its unit, and
+    /// in AC its amplitude and phase in degrees.
+    func mapleResult(_ target: WalkTarget, _ expression: String, value: Complex?) -> String {
+        let size = value.map { WalkFormat.isReal($0) ? $0.re : $0.magnitude }
+        let digits = MapleExporter.significantDigits(for: size)
+        let unit = MapleExporter.prefixed(size, base: target.mapleUnit).unit
+        let name = target.mapleName
+        var result = "\(name) := evalf(convert(\(expression), 'units', '\(unit)'), \(digits));"
+        if isAC {
+            result += "\nevalf(abs(\(name)/Unit('\(unit)')), \(digits))*Unit('\(unit)'), evalf(argument(\(name)/Unit('\(unit)'))*180/Pi, 4);"
+        }
+        return result
+    }
+
+    /// The current through a resistor, capacitor or inductor from the
+    /// voltage across it, in Maple: (a - b)/R1, (a - b)*I*omega*C1, (a - b)/(I*omega*L1).
+    func mapleCurrent(_ part: WalkPart, across: String) -> String {
+        switch part.kind {
+        case .capacitor: "(\(across))*I*omega*\(part.mapleName)"
+        case .inductor: "(\(across))/(I*omega*\(part.mapleName))"
+        default: "(\(across))/\(part.mapleName)"
+        }
+    }
+
+    /// The voltage across a resistor, capacitor or inductor from the current
+    /// through it, in Maple: R1*(i), (i)/(I*omega*C1), I*omega*L1*(i).
+    func mapleVoltage(_ part: WalkPart, current: String) -> String {
+        switch part.kind {
+        case .capacitor: "(\(current))/(I*omega*\(part.mapleName))"
+        case .inductor: "I*omega*\(part.mapleName)*(\(current))"
+        default: "\(part.mapleName)*(\(current))"
+        }
     }
 }
 
@@ -501,7 +704,27 @@ nonisolated enum WalkError: Error {
 
 nonisolated enum Walkthrough {
     static func make(_ method: WalkMethod, for circuit: Circuit) -> WalkResult {
+        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches())
+        if !lowSide.isEmpty {
+            var lines: [WalkLine] = []
+            for output in lowSide {
+                guard let voltage = output.openVoltage else { return .unavailable(output.issue.detail) }
+                lines.append(.text("\(output.name) er sat til 0 V og er en low-side udgang (LSO): åben (høj) i duty cyclen D og trukket ned til 0 V resten af perioden."))
+                lines.append(.text("Med \(output.name) taget ud (DC: kondensatorer afbrudt, spoler kortsluttet) er spændingen over den:"))
+                lines.append(.math("V_{\(output.name),\\text{åben}} = \(WalkFormat.quantity(voltage, .volt))"))
+                lines.append(.text("Så \(output.name) regnes som et firkantsignal mellem 0 V og \(SIValue.format(voltage, unit: "V")). Med kondensatorer eller spoler er grundtonen en tilnærmelse, da en åben udgang ikke fører strøm."))
+            }
+            switch make(method, for: circuit) {
+            case .unavailable(let reason): return .unavailable(reason)
+            case .steps(let sections, let maple):
+                return .steps([WalkSection(title: "Low-side udgang (LSO)", lines: lines)] + sections, maple: maple)
+            }
+        }
+        if circuit.usesFourier { return makeFourier(method, for: circuit) }
         let diodes = circuit.components.filter { $0.kind.isDiode }
+        if circuit.isAC, let diode = diodes.first {
+            return .unavailable("\(diode.name) er en diode, og dioder kan ikke regnes med fasorer (AC).")
+        }
         guard !diodes.isEmpty else { return makeLinear(method, for: circuit) }
         if let unknown = diodes.first(where: { $0.value == nil }) {
             return .unavailable("\(unknown.name) har ingen tærskelspænding.")
@@ -552,8 +775,68 @@ nonisolated enum Walkthrough {
         }
     }
 
-    /// A walkthrough of a circuit of linear components only.
+    /// A circuit with a non-sine signal generator in two parts: the averages,
+    /// where each generator is its waveform's average, and the fundamental,
+    /// its first Fourier term with phasors and the other sources off.
+    private static func makeFourier(_ method: WalkMethod, for circuit: Circuit) -> WalkResult {
+        var intro: [WalkLine] = [
+            .text("Signalet deles op i sin middelværdi og sine sinusformede led (Fourier-rækken), som hver regnes for sig (superposition)."),
+        ]
+        for generator in circuit.components where generator.kind == .signalGenerator {
+            let waveform = generator.signalWaveform
+            let a = generator.value ?? 0, d = generator.dutyFraction
+            let name = WalkFormat.name(generator.name)
+            let average = waveform.average(a, duty: d)
+            let fundamental = waveform.fundamental(a, duty: d) * Complex(magnitude: 1, degrees: generator.phase ?? 0)
+            intro.append(.text("\(generator.name) er \(waveform.explanation):"))
+            intro.append(.math(waveform.seriesLatex))
+            var values = "A = \(WalkFormat.quantity(a, .volt))"
+            if waveform.hasDutyCycle { values += ",\\; D = \(WalkFormat.number(d))" }
+            intro.append(.math("\(name):\\; \(values) \\Rightarrow \\text{middelværdi } \(WalkFormat.quantity(average, .volt)),\\; \\text{grundtone } \(WalkFormat.phasor(fundamental, .volt))"))
+        }
+        intro.append(.text("Del 1 er middelværdierne (DC: kondensatorer afbrudt, spoler kortsluttet). Del 2 er grundtonen med fasorer ved generatorens frekvens, hvor de andre kilder er slukket. De højere harmoniske er udeladt."))
+
+        let averageCircuit = circuit.averageCircuit()
+        let solution = CircuitSolver.solve(averageCircuit)
+        let fundamentalCircuit = circuit.fundamentalCircuit(componentValues: solution.componentValues)
+        var sections = [WalkSection(title: "Signalet", lines: intro)]
+        var maple: [String] = []
+        for (title, part) in [("Middelværdi", averageCircuit), ("Grundtone", fundamentalCircuit)] {
+            switch make(method, for: part) {
+            case .unavailable(let reason):
+                sections.append(WalkSection(title: title, lines: [.text(reason)]))
+            case .steps(let steps, let code):
+                sections += steps.map { WalkSection(title: "\(title) – \($0.title)", lines: $0.lines) }
+                if let code { maple += ["# \(title)", code, ""] }
+            }
+        }
+        return .steps(sections, maple: maple.isEmpty ? nil : maple.joined(separator: "\n"))
+    }
+
+    /// A walkthrough of a circuit of linear components only. In DC
+    /// capacitors are taken out (open) and inductors become wires (a short).
     private static func makeLinear(_ method: WalkMethod, for circuit: Circuit) -> WalkResult {
+        let reactive = circuit.components.filter { $0.kind.isReactive }
+        guard circuit.isAC || reactive.isEmpty else {
+            var dc = circuit
+            dc.components.removeAll { $0.kind.isReactive }
+            for inductor in reactive where inductor.kind == .inductor {
+                dc.wires.append(Wire(points: [inductor.start, inductor.end]))
+            }
+            let names = { (kind: ComponentKind) in reactive.filter { $0.kind == kind }.map(\.name).joined(separator: ", ") }
+            var lines: [WalkLine] = [.text("Kredsløbet regnes med jævnstrøm (DC), når alt er faldet til ro:")]
+            if reactive.contains(where: { $0.kind == .capacitor }) {
+                lines.append(.text("Kondensatorer fører ingen strøm og tages ud (afbrydelse): \(names(.capacitor))."))
+            }
+            if reactive.contains(where: { $0.kind == .inductor }) {
+                lines.append(.text("Spoler har ingen spænding over sig og erstattes af en ledning (kortslutning): \(names(.inductor))."))
+            }
+            switch makeLinear(method, for: dc) {
+            case .unavailable(let reason): return .unavailable(reason)
+            case .steps(let sections, let maple):
+                return .steps([WalkSection(title: "Jævnstrøm (DC)", lines: lines)] + sections, maple: maple)
+            }
+        }
         switch WalkModel.make(circuit) {
         case .failure(let error):
             return .unavailable(error.text)

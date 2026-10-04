@@ -130,6 +130,8 @@ struct SchematicCanvas: View {
         .simultaneousGesture(magnifyGesture)
         // Right-drag pans; with ⌘ held it draws an excluded area instead.
         .panGesture(PanRecognizer(input: .secondaryButton, onBegan: beginRightDrag, onChanged: rightDrag, onEnded: endRightDrag))
+        // A right-click on a symbol opens its editor, like a double-click.
+        .secondaryClickGesture(SecondaryClickRecognizer(onClick: rightClick))
         #if os(iOS)
         .panGesture(PanRecognizer(input: .twoFingers, onBegan: { _ in cancelDrag() }, onChanged: pan))
         #endif
@@ -283,6 +285,12 @@ struct SchematicCanvas: View {
         editor.addExcludedArea(from: snap(draft.start), to: snap(draft.current))
     }
 
+    /// Opens the editor of the symbol under a right-click, if it has one.
+    private func rightClick(at location: CGPoint) {
+        guard let hit = editor.hitTest(worldPoint(location), tolerance: 8 / scale), isEditable(hit) else { return }
+        openEditor(for: hit)
+    }
+
     private func pan(by delta: CGSize) {
         offset = CGSize(width: offset.width + delta.width, height: offset.height + delta.height)
     }
@@ -291,6 +299,7 @@ struct SchematicCanvas: View {
     private func cancelDrag() {
         currentStroke = []
         powerDraft = nil
+        editor.releaseButtons()
         if case .splittingProbe(_, _, true) = dragMode {
             editor.endMove()
             dragMode = .cancelled
@@ -435,6 +444,8 @@ struct SchematicCanvas: View {
             } else if let hit = editor.hitTest(worldPoint(location), tolerance: 8 / scale) {
                 let (item, tapSelection) = selectionForHit(hit)
                 editor.selection = item
+                // A push button is closed while it's held down.
+                if let button = editor.switchComponent(hit), button.kind == .pushButton { editor.pressButton(id: button.id) }
                 dragMode = .moving(item: item, origin: start, didBegin: false, tapSelection: tapSelection)
             } else {
                 dragMode = .selectingArea(start: location, current: location)
@@ -576,10 +587,15 @@ struct SchematicCanvas: View {
                 )
             }
         case .moving(_, _, let didBegin, let tapSelection):
+            editor.releaseButtons()
             if didBegin {
                 editor.endMove()
             } else {
                 editor.selection = tapSelection
+                // Clicking a switch opens or closes it.
+                if let toggle = editor.switchComponent(tapSelection), toggle.kind == .toggleSwitch {
+                    editor.toggleSwitch(id: toggle.id)
+                }
                 handleTap(on: tapSelection)
             }
         case .resizingGroup(_, _, _, let didBegin):
@@ -850,7 +866,7 @@ struct SchematicCanvas: View {
             let point = screenPoint(probe.position)
             SymbolRenderer.drawProbe(at: point, unit: unit, color: color, in: context)
             drawValueLabel(
-                name: probe.name, value: probe.value, computed: solution.probeValues[probe.id],
+                name: probe.name, value: probe.value, computed: solution.probeValues[probe.id], phase: solution.phases[probe.id], id: probe.id,
                 unit: "V", color: color, in: context
             ) { text in
                 context.draw(text, at: CGPoint(x: point.x + unit * 0.5, y: point.y - unit * 0.45), anchor: .bottomLeading)
@@ -866,6 +882,9 @@ struct SchematicCanvas: View {
             lineWidth: max(1, 2 * scale), resistorStyle: resistorStyle,
             // A conducting LED is drawn lit.
             isLit: component.kind == .led && solution.diodeConducts[component.id] == true,
+            waveform: component.signalWaveform,
+            isClosed: editor.isClosed(component),
+            isNormallyClosed: component.isNormallyClosed,
             in: context
         )
 
@@ -886,6 +905,17 @@ struct SchematicCanvas: View {
         if component.kind.isDependent {
             let control = subscriptedName(component.controlLabel, font: font, size: size, weight: .medium, color: theme.label)
             value = Text("\(value)\(Text(" · ").font(font).foregroundStyle(theme.label))\(control)")
+        }
+        // Signal generators show their phase, duty cycle and frequency, e.g.
+        // "5 V, 10 %, 1 kHz"; a low-side output only "10 %, 1 kHz".
+        if component.isLowSideOutput, let label = component.signalLabel(valueText: "") {
+            value = Text(label).font(font).foregroundStyle(theme.label)
+        } else if let details = component.signalDetails {
+            value = Text("\(value)\(Text(details).font(font).foregroundStyle(theme.label))")
+        }
+        // Switches have no value, only their name.
+        if component.kind.isSwitch {
+            value = Text(component.isNormallyClosed ? "NC" : "").font(font).foregroundStyle(theme.label)
         }
         if component.start.y == component.end.y {
             context.draw(name, at: CGPoint(x: mid.x, y: mid.y - unit * 1.1), anchor: .bottom)
@@ -937,11 +967,8 @@ struct SchematicCanvas: View {
         let size = max(7, unit * 0.6)
         let font = Font.system(size: size, weight: .semibold)
         let name = subscriptedName(equivalent.name, font: font, size: size, color: color)
-        let value: Text = if !studyMode, case .value(let resistance, _) = editor.equivalentResults[equivalent.id] {
-            Text(SIValue.format(resistance, unit: "Ω")).font(font).foregroundStyle(color)
-        } else {
-            Text(SIValue.format(nil, unit: "Ω")).font(font).foregroundStyle(color)
-        }
+        let valueText = studyMode ? SIValue.format(nil, unit: "Ω") : editor.equivalentResults[equivalent.id]?.formatted ?? SIValue.format(nil, unit: "Ω")
+        let value = Text(valueText).font(font).foregroundStyle(color)
         let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
         if equivalent.start.y == equivalent.end.y {
             context.draw(name, at: CGPoint(x: mid.x, y: mid.y - unit * 1.1), anchor: .bottom)
@@ -957,7 +984,7 @@ struct SchematicCanvas: View {
         SymbolRenderer.drawCurrentArrowhead(at: point, direction: direction, size: unit * 0.9, color: color, in: context)
 
         drawValueLabel(
-            name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id],
+            name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id], phase: solution.phases[arrow.id], id: arrow.id,
             unit: "A", color: color, in: context
         ) { text in
             if abs(direction.x) > abs(direction.y) {
@@ -1074,7 +1101,10 @@ struct SchematicCanvas: View {
             let valueColor = isLabelSelected ? color : (editor.isInherited(probe.name) ? theme.inherited : color)
             text = Text("\(text)\(Text(" = " + SIValue.format(value, unit: "V")).font(font).foregroundStyle(valueColor))")
         } else if let computed = solution.probeValues[probe.id] {
-            text = Text("\(text)\(Text(" = " + SIValue.format(computed, unit: "V")).font(font.italic()).foregroundStyle(theme.computed))")
+            text = Text("\(text)\(Text(" = " + SIValue.format(computed, unit: "V", phase: solution.phases[probe.id])).font(font.italic()).foregroundStyle(theme.computed))")
+        }
+        if let fundamental = solution.fundamentalText(probe.id, unit: "V") {
+            text = Text("\(text)\(Text("  " + fundamental).font(font.italic()).foregroundStyle(theme.computed))")
         }
         context.draw(text, at: labelPoint, anchor: .center)
     }
@@ -1262,22 +1292,25 @@ struct SchematicCanvas: View {
     /// A "Name = value" label, or just the name while the value is unknown.
     /// A value the calculation filled in is shown in grey italics.
     private func drawValueLabel(
-        name: String, value: Double?, computed: Double?, unit valueUnit: String, color: Color,
+        name: String, value: Double?, computed: Double?, phase: Double? = nil, id: UUID? = nil, unit valueUnit: String, color: Color,
         in context: GraphicsContext, place: (Text) -> Void
     ) {
         let size = max(7, unit * 0.6)
         let font = Font.system(size: size, weight: .medium)
         let nameText = subscriptedName(name, font: font, size: size, weight: .medium, color: color)
+        // With PWM the fundamental follows the average: "~ 0,4 V ∠ −80°".
+        let fundamental = id.flatMap { solution.fundamentalText($0, unit: valueUnit) }
+            .map { Text("  " + $0).font(font.italic()).foregroundStyle(theme.computed) } ?? Text("")
         if let value {
             // A value given by a "!name := …" line in a text box is shown in purple.
             let valueColor = editor.isInherited(name) ? theme.inherited : color
             let valueText = Text(" = " + SIValue.format(value, unit: valueUnit)).font(font).foregroundStyle(valueColor)
-            place(Text("\(nameText)\(valueText)"))
+            place(Text("\(nameText)\(valueText)\(fundamental)"))
         } else if let computed {
-            let valueText = Text(" = " + SIValue.format(computed, unit: valueUnit)).font(font.italic()).foregroundStyle(theme.computed)
-            place(Text("\(nameText)\(valueText)"))
+            let valueText = Text(" = " + SIValue.format(computed, unit: valueUnit, phase: phase)).font(font.italic()).foregroundStyle(theme.computed)
+            place(Text("\(nameText)\(valueText)\(fundamental)"))
         } else {
-            place(nameText)
+            place(Text("\(nameText)\(fundamental)"))
         }
     }
 
