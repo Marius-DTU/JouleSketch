@@ -1,4 +1,8 @@
-# JouleSketch
+<p align="center">
+  <img src="docs/logo.png" alt="JouleSketch-logo" width="160">
+</p>
+
+<h1 align="center">JouleSketch</h1>
 
 JouleSketch er et program til at tegne og regne elektriske kredsløb. Man tegner
 diagrammet på et ark med gitter, skriver de kendte værdier på, og så finder
