@@ -1,21 +1,61 @@
 <p align="center">
-  <img src="docs/logo.png" alt="JouleSketch-logo" width="160">
+  <img src="docs/logo.png" alt="JouleSketch-logo" width="140">
 </p>
 
 <h1 align="center">JouleSketch</h1>
 
-JouleSketch er et program til at tegne og regne elektriske kredsløb. Man tegner
-diagrammet på et ark med gitter, skriver de kendte værdier på, og så finder
-programmet resten: spændinger, strømme, effekter og manglende
-komponentværdier. Det kan også vise udregningen trin for trin og lave
-Maple-kode, man kan sætte ind i en afleveringsopgave.
+<p align="center">
+  <b>Tegn et kredsløb – og få resten regnet ud.</b><br>
+  Spændinger, strømme, effekter og manglende komponentværdier, trin-for-trin-gennemgange og Maple-kode til afleveringen.
+</p>
+
+<p align="center">
+  <img alt="macOS 15+" src="https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white">
+  <img alt="iPadOS 18+" src="https://img.shields.io/badge/iPadOS-18%2B-000000?logo=apple&logoColor=white">
+  <img alt="Web" src="https://img.shields.io/badge/Windows%20%2F%20web-browser-0078D4?logo=googlechrome&logoColor=white">
+  <img alt="Swift" src="https://img.shields.io/badge/Swift-SwiftUI%20%2B%20WebAssembly-F05138?logo=swift&logoColor=white">
+</p>
+
+<p align="center">
+  <a href="#funktioner">Funktioner</a> ·
+  <a href="#genvejstaster">Genvejstaster</a> ·
+  <a href="#kom-i-gang">Kom i gang</a> ·
+  <a href="#opbygning">Opbygning</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="Et kredsløb i JouleSketch med en spændingsstyret kilde, en lysdiode og beregnede spændinger" width="860">
+  <br>
+  <sub>Kendte værdier står med almindelig skrift; det beregnede (her V<sub>A</sub> og spændingsfaldet V<sub>B</sub> over lysdioden) vises med grå kursiv.</sub>
+</p>
+
+## Hvad kan den?
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <h3>✏️ Tegn</h3>
+      Komponenter, ledninger, stel og målepunkter sætter sig fast på gitteret. Klik for at placere, eller træk fra punkt til punkt.
+    </td>
+    <td width="33%" valign="top">
+      <h3>⚡ Regn</h3>
+      Skriv det, du kender – resten findes med det samme. DC, AC med fasorer, PWM, dioder og styrede kilder.
+    </td>
+    <td width="33%" valign="top">
+      <h3>📐 Forstå</h3>
+      Knudepunkts-, maske- og superpositionsmetoden trin for trin, og Maple-kode, der er klar til at sætte ind i opgaven.
+    </td>
+  </tr>
+</table>
 
 Der er to versioner, som bygger på den samme kode:
 
 | Version | Platform | Hvor |
 |---|---|---|
-| App | Mac (macOS 15+) og iPad (iPadOS 18+) | `JouleSketch.xcodeproj` (SwiftUI) |
-| Web | Windows og alle andre computere, i browseren | `Web/` (Swift → WebAssembly) |
+| 🖥️ App | Mac (macOS 15+) og iPad (iPadOS 18+) | `JouleSketch.xcodeproj` (SwiftUI) |
+| 🌐 Web | Windows og alle andre computere, i browseren | `Web/` (Swift → WebAssembly) |
+
+Begge versioner har en indbygget guide, **Sådan bruger du JouleSketch** (i menuen ⋯ Visning på Mac/iPad og ⓘ på web), som gennemgår hele programmet.
 
 ## Funktioner
 
@@ -70,6 +110,7 @@ Trin-for-trin-udregninger med formler, som man kan følge eller bruge som facit:
   strømmene skrevet med Ohms lov.
 - **Maskestrømsmetoden** – Kirchhoffs spændingslov rundt i hver maske
   (kræver et plant diagram).
+- **Superposition** – hver kilde regnes for sig, og bidragene lægges sammen.
 
 ### Maple-eksport
 Kredsløbet skrives som Maple-kode efter knudepunktsmetoden: kendte værdier
