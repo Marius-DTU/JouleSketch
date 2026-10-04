@@ -24,9 +24,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Et kredsløb i JouleSketch med en spændingsstyret kilde, en lysdiode og beregnede spændinger" width="860">
+  <img src="docs/screenshot.png" alt="Et kredsløb i JouleSketch, hvor forstærkningen i en spændingsstyret kilde og en modstand findes ud fra to kendte spændinger" width="860">
   <br>
-  <sub>Kendte værdier står med almindelig skrift; det beregnede (her V<sub>A</sub> og spændingsfaldet V<sub>B</sub> over lysdioden) vises med grå kursiv.</sub>
+  <sub>Skriv de spændinger, du vil have – V<sub>A</sub> = 4 V og V<sub>B</sub> = 3,5 V over lysdioden – og JouleSketch finder komponentværdierne: forstærkningen i S1 og R3 vises med grå kursiv.</sub>
 </p>
 
 ## Hvad kan den?
