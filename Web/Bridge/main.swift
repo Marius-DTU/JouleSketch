@@ -14,6 +14,8 @@ import JavaScriptKit
     private let undo = UndoManager()
     private var viewSize = CGSize(width: 800, height: 600)
     private var keyBindings = KeyBindings()
+    /// The user's block library, kept in the browser's storage by the page.
+    private var library = BlockLibrary()
     private var resistorStyle = SceneResistorStyle.iec
     private var showGrid = true
     private var studyMode = false
@@ -45,7 +47,7 @@ import JavaScriptKit
     @JS func save() -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(CircuitFile(circuit: editor.circuit)) else { return "" }
+        guard let data = try? encoder.encode(CircuitFile(circuit: editor.documentCircuit)) else { return "" }
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -53,6 +55,73 @@ import JavaScriptKit
         editor.load(Circuit())
         undo.removeAllActions()
         editor.resetView()
+    }
+
+    // MARK: Block library
+
+    /// Sets the library from the browser's storage.
+    @JS func setLibrary(_ storage: String) {
+        library = BlockLibrary(storageString: storage)
+    }
+
+    /// The library as the page keeps it in the browser's storage.
+    @JS func libraryStorage() -> String {
+        library.storageString
+    }
+
+    /// The library's blocks, as JSON `[{id, name, summary}]`.
+    @JS func libraryList() -> String {
+        let json = JSONWriter()
+        json.array(library.entries) { entry in
+            json.object {
+                json.field("id", entry.id.uuidString)
+                json.field("name", entry.name)
+                json.field("summary", entry.summary)
+            }
+        }
+        return json.text
+    }
+
+    /// Saves a block (by item key) in the library. Returns a message, or "" if it isn't a block.
+    @JS func addToLibrary(_ key: String) -> String {
+        guard case .gate(let id)? = SelectionKey.decode(key), let gate = editor.gate(id: id), gate.kind == .block else { return "" }
+        library.add(gate)
+        return "\(gate.name.isEmpty ? "Blokken" : gate.name) er gemt i biblioteket."
+    }
+
+    /// The selected block's item key, or "" when no block is selected.
+    @JS func selectedBlock() -> String {
+        guard case .gate(let id)? = editor.selection, editor.gate(id: id)?.kind == .block else { return "" }
+        return SelectionKey.encode(.gate(id))
+    }
+
+    @JS func removeFromLibrary(_ id: String) {
+        if let uuid = UUID(uuidString: id) { library.remove(id: uuid) }
+    }
+
+    /// Picks the block tool with a library block.
+    @JS func placeFromLibrary(_ id: String) {
+        guard let uuid = UUID(uuidString: id), let entry = library.entry(id: uuid) else { return }
+        interaction.resetDrag()
+        editor.placeFromLibrary(entry)
+    }
+
+    /// The library, or one block of it (by id), as a file to export.
+    @JS func exportLibrary(_ id: String) -> String {
+        let ids = UUID(uuidString: id).map { Set([$0]) }
+        return String(decoding: library.exportData(ids: ids), as: UTF8.self)
+    }
+
+    /// Imports an exported library file. Returns a message for the user.
+    @JS func importLibrary(_ text: String) -> String {
+        library.importFile(Data(text.utf8))
+    }
+
+    // MARK: Blocks' sub-diagrams
+
+    /// Goes out to the sheet at `index` of the way in (0: the document's own sheet).
+    @JS func leaveBlockTo(_ index: Int) {
+        editor.leaveBlock(toLevel: index)
     }
 
     // MARK: Settings
@@ -157,10 +226,11 @@ import JavaScriptKit
 
     /// A key pressed on the sheet without Ctrl or Alt. Returns whether it was used.
     @JS func key(_ characters: String) -> Bool {
-        guard let action = keyBindings.action(for: characters) else { return false }
+        guard let action = keyBindings.action(for: characters, mode: editor.sheetMode) else { return false }
         switch action {
         case .rotate: editor.rotate()
         case .selectWholeWire: editor.selectWholeWires()
+        case .leaveBlock: editor.leaveBlock()
         default:
             guard let tool = action.tool else { return false }
             setTool(tool)
@@ -184,7 +254,7 @@ import JavaScriptKit
     /// where `shown` is the tool the button shows and picks.
     @JS func toolGroups() -> String {
         let json = JSONWriter()
-        json.array(ToolGroup.allCases) { group in
+        json.array(ToolGroup.palette(for: editor.sheetMode, insideBlock: editor.isInsideBlock)) { group in
             json.object {
                 json.field("id", group.id)
                 json.field("title", group.title)
@@ -194,6 +264,12 @@ import JavaScriptKit
             }
         }
         return json.text
+    }
+
+    /// Makes a new document analog or digital (the start page): "analog" or "digital".
+    @JS func chooseMode(_ mode: String) {
+        editor.chooseMode(SheetMode(rawValue: mode) ?? .analog)
+        undo.removeAllActions()
     }
 
     private func setTool(_ tool: Tool) {
@@ -211,6 +287,7 @@ import JavaScriptKit
         case "rotate": editor.rotate()
         case "selectAll": editor.selectAll()
         case "selectWholeWire": editor.selectWholeWires()
+        case "leaveBlock": editor.leaveBlock()
         case "copy": editor.copySelection()
         case "paste": editor.paste(at: interaction.hoverPoint)
         case "clearAll": editor.clearAll()
@@ -235,6 +312,7 @@ import JavaScriptKit
                 json.field("command", action.usesCommand)
                 json.field("shift", action.usesShift)
                 json.field("conflict", conflicts.contains(action))
+                json.field("mode", action.mode?.rawValue)
             }
         }
         return json.text
@@ -267,7 +345,17 @@ import JavaScriptKit
         scene.resistorStyle = resistorStyle
         scene.showGrid = showGrid
         scene.studyMode = studyMode
+        scene.time = Date().timeIntervalSinceReferenceDate
         return SceneJSON.encode(scene.build())
+    }
+
+    /// Milliseconds until a signal generator next changes something on the
+    /// sheet (an LED blinking, a value shown as it is right now), or −1 if
+    /// nothing changes over time.
+    @JS func nextChange() -> Double {
+        let now = Date().timeIntervalSinceReferenceDate
+        guard let next = editor.nextRedraw(after: now) else { return -1 }
+        return max(0, (next - now) * 1000)
     }
 
     /// A palette icon (30 × 24 points) for a tool id, "pen" or "eraser", as
@@ -292,6 +380,8 @@ import JavaScriptKit
         let json = JSONWriter()
         json.object {
             json.field("tool", editor.isDrawing ? (editor.isErasing ? "eraser" : "pen") : editor.tool.id)
+            // null while the start page is shown.
+            json.field("mode", editor.needsModeChoice ? nil : editor.sheetMode.rawValue)
             json.field("canUndo", undo.canUndo)
             json.field("canRedo", undo.canRedo)
             json.field("hasSelection", editor.selection != nil)
@@ -303,6 +393,9 @@ import JavaScriptKit
             json.field("editing", editor.editingTextBox?.uuidString)
             json.field("isComplete", editor.solution.isComplete)
             json.field("issueCount", editor.solution.issues.filter { $0.kind != .notice }.count)
+            // The way into the block being edited; empty on the document's sheet.
+            json.key("blockTrail")
+            json.array(editor.isInsideBlock ? editor.blockTrail : []) { json.value($0) }
             json.key("textBoxes")
             json.array(editor.circuit.textBoxes) { box in
                 let origin = interaction.screenPoint(box.position)
@@ -378,6 +471,16 @@ import JavaScriptKit
                 json.field("controlPlaceholder", component.kind.isVoltageControlled ? "Vs" : "Is")
                 json.field("showsPower", component.isPowerShown)
                 json.field("power", solution.powerValues[id].map { SIValue.format($0, unit: "W") })
+                if component.kind == .led {
+                    json.field("ledColor", component.ledColor.rawValue)
+                    json.key("ledColors")
+                    json.array(LEDColor.allCases) { color in
+                        json.object {
+                            json.field("id", color.rawValue)
+                            json.field("name", "\(color.displayName) (\(SIValue.format(color.kneeVoltage, unit: "V")))")
+                        }
+                    }
+                }
                 if component.kind == .signalGenerator {
                     json.field("frequency", component.frequency.map { SIValue.format($0, unit: "Hz") } ?? "")
                     json.field("phase", SIValue.format(component.phase ?? 0, unit: "°"))
@@ -406,9 +509,8 @@ import JavaScriptKit
                 json.field("name", probe.name)
                 json.field("value", probe.value.map { SIValue.format($0, unit: "V") } ?? "")
                 json.field("valueTitle", "Spænding (V)")
-                json.field("computed", solution.probeValues[id].map {
-                    [SIValue.format($0, unit: "V", phase: solution.phases[id]), solution.fundamentalText(id, unit: "V")].compactMap { $0 }.joined(separator: " ")
-                })
+                json.field("computed", solution.measurementText(id, mode: probe.measure, unit: "V", at: Date().timeIntervalSinceReferenceDate))
+                writeMeasure(probe.measure, to: json)
                 json.field("note", probe.note)
             }
         case .currentArrow(let id):
@@ -420,9 +522,8 @@ import JavaScriptKit
                 json.field("name", arrow.name)
                 json.field("value", arrow.value.map { SIValue.format($0, unit: "A") } ?? "")
                 json.field("valueTitle", "Strøm (A)")
-                json.field("computed", solution.currentValues[id].map {
-                    [SIValue.format($0, unit: "A", phase: solution.phases[id]), solution.fundamentalText(id, unit: "A")].compactMap { $0 }.joined(separator: " ")
-                })
+                json.field("computed", solution.measurementText(id, mode: arrow.measure, unit: "A", at: Date().timeIntervalSinceReferenceDate))
+                writeMeasure(arrow.measure, to: json)
                 json.field("note", arrow.note)
             }
         case .meshMarker(let id):
@@ -433,6 +534,35 @@ import JavaScriptKit
                 json.field("title", "Maskestrøm")
                 json.field("name", marker.name)
                 json.field("clockwise", marker.clockwise)
+            }
+        case .gate(let id):
+            guard let gate = editor.gate(id: id) else { return "" }
+            json.object {
+                json.field("type", "gate")
+                json.field("item", SelectionKey.encode(item))
+                json.field("title", gate.kind.displayName)
+                json.field("name", gate.name)
+                // Inside a block, its inputs and outputs are named after its terminals.
+                json.field("nameLocked", editor.isInsideBlock && (gate.kind == .input || gate.kind == .output))
+                json.field("kind", gate.kind.rawValue)
+                json.field("isGate", gate.kind.isGate)
+                json.field("allowsMoreInputs", gate.kind.allowsMoreInputs)
+                json.field("inputCount", gate.inputCount)
+                json.field("minInputs", GateKind.inputRange.lowerBound)
+                json.field("maxInputs", GateKind.inputRange.upperBound)
+                json.field("high", gate.isHigh == true)
+                if gate.kind == .block {
+                    json.field("blockInputs", (gate.blockInputs ?? []).joined(separator: "\n"))
+                    json.field("blockOutputs", (gate.blockOutputs ?? []).joined(separator: "\n"))
+                }
+                json.field("logicValue", editor.logicValue(of: gate).map { $0 ? "1" : "0" } ?? "ukendt")
+                json.key("kinds")
+                json.array(GateKind.gates) { kind in
+                    json.object {
+                        json.field("id", kind.rawValue)
+                        json.field("name", kind.shortName)
+                    }
+                }
             }
         case .groupArea(let id):
             guard let group = editor.groupArea(id: id) else { return "" }
@@ -446,6 +576,25 @@ import JavaScriptKit
             return ""
         }
         return json.text
+    }
+
+    /// A voltage point's or current's measure mode and the modes to pick
+    /// from (MeasureMode), for its editor.
+    private func writeMeasure(_ mode: MeasureMode?, to json: JSONWriter) {
+        json.field("measure", (mode ?? .auto).rawValue)
+        json.key("measures")
+        json.array(MeasureMode.allCases) { mode in
+            json.object {
+                json.field("id", mode.rawValue)
+                json.field("name", mode.displayName)
+            }
+        }
+    }
+
+    /// A measure mode from its editor; `nil` for automatic.
+    private static func measureMode(_ text: String) -> MeasureMode? {
+        let mode = MeasureMode(rawValue: text) ?? .auto
+        return mode == .auto ? nil : mode
     }
 
     /// Changes one field of an item's editor. Values are parsed like the Mac
@@ -468,12 +617,13 @@ import JavaScriptKit
                 }
                 editor.updateComponent(id: id) { $0.value = value }
             case "frequency":
-                if let value, value <= 0 { return "Frekvensen skal være positiv" }
+                if let value, value < 0 { return "Frekvensen kan ikke være negativ" }
                 editor.updateComponent(id: id) { $0.frequency = value }
             case "phase": editor.updateComponent(id: id) { $0.phase = value }
             case "waveform":
                 let waveform = SignalWaveform(rawValue: text) ?? .sine
                 editor.updateComponent(id: id) { $0.waveform = waveform == .sine ? nil : waveform }
+            case "ledColor": editor.setLEDColor(LEDColor(rawValue: text) ?? .red, id: id)
             case "dutyCycle":
                 if let value, value < 0 || value > 100 { return "Duty cycle skal være mellem 0 og 100 %" }
                 editor.updateComponent(id: id) { $0.dutyCycle = value }
@@ -489,6 +639,7 @@ import JavaScriptKit
             switch field {
             case "name": editor.updateProbe(id: id) { $0.name = text }
             case "value": editor.updateProbe(id: id) { $0.value = value }
+            case "measure": editor.updateProbe(id: id) { $0.measure = Self.measureMode(text) }
             case "note": editor.updateProbe(id: id) { $0.note = text }
             default: break
             }
@@ -496,6 +647,7 @@ import JavaScriptKit
             switch field {
             case "name": editor.updateCurrentArrow(id: id) { $0.name = text }
             case "value": editor.updateCurrentArrow(id: id) { $0.value = value }
+            case "measure": editor.updateCurrentArrow(id: id) { $0.measure = Self.measureMode(text) }
             case "note": editor.updateCurrentArrow(id: id) { $0.note = text }
             case "flip": editor.flipCurrentArrow(id: id)
             default: break
@@ -508,6 +660,18 @@ import JavaScriptKit
             }
         case .groupArea(let id):
             if field == "name" { editor.updateGroupArea(id: id) { $0.name = text } }
+        case .gate(let id):
+            switch field {
+            case "name": editor.updateGate(id: id) { $0.name = text }
+            case "kind": if let kind = GateKind(rawValue: text) { editor.updateGate(id: id) { $0.kind = kind } }
+            case "inputCount": if let count = Int(text) { editor.updateGate(id: id) { $0.inputCount = count } }
+            case "high": if (text == "true") != (editor.gate(id: id)?.isHigh == true) { editor.toggleInput(id: id) }
+            case "blockInputs": editor.updateGate(id: id) { $0.blockInputs = LogicGate.pinNames(from: text) }
+            case "blockOutputs": editor.updateGate(id: id) { $0.blockOutputs = LogicGate.pinNames(from: text) }
+            case "openBlock": editor.enterBlock(id: id)
+            case "flip": editor.rotateGate(id: id)
+            default: break
+            }
         default:
             break
         }
@@ -564,6 +728,7 @@ import JavaScriptKit
                     case .conflict: "conflict"
                     case .missing: "missing"
                     case .notice: "notice"
+                    case .warning: "warning"
                     }
                     json.field("kind", kind)
                     json.field("title", issue.title)
@@ -624,17 +789,28 @@ import JavaScriptKit
         return json.text
     }
 
-    /// A walkthrough by `method` ("nodal", "mesh" or "superposition") of the
-    /// whole document or one group, with its Maple code, as JSON.
+    /// A walkthrough by `method` ("nodal", "mesh", "superposition" or
+    /// "equivalent") of the whole document or one group, with its Maple code,
+    /// as JSON. Also lists the methods offered (the equivalent resistance only
+    /// when one is drawn) and the one shown.
     @JS func walkthrough(_ method: String, _ groupID: String) -> String {
         var circuit = editor.calculationCircuit
         if let group = circuit.groupAreas.first(where: { $0.id.uuidString == groupID }) {
             circuit = circuit.inside(group)
         }
-        let walkMethod = WalkMethod(rawValue: method) ?? .nodal
+        let methods = WalkMethod.available(for: circuit)
+        let walkMethod = WalkMethod(rawValue: method).flatMap { methods.contains($0) ? $0 : nil } ?? .nodal
         let result = Walkthrough.make(walkMethod, for: circuit)
         let json = JSONWriter()
         json.object {
+            json.field("method", walkMethod.rawValue)
+            json.key("methods")
+            json.array(methods) { option in
+                json.object {
+                    json.field("id", option.rawValue)
+                    json.field("title", option.title)
+                }
+            }
             switch result {
             case .unavailable(let reason):
                 json.field("unavailable", reason)
@@ -665,6 +841,164 @@ import JavaScriptKit
         return json.text
     }
 
+    // MARK: Truth tables and Karnaugh maps
+
+    /// The truth table of the drawn circuit, as JSON: its inputs, outputs,
+    /// problems, the expression the drawing computes for output `output`, and
+    /// its analysis in `form` ("sumOfProducts" or "productOfSums").
+    @JS func logicCircuit(_ output: Int, _ form: String) -> String {
+        let network = editor.logicNetwork
+        let variables = network.variables
+        let outputs = network.outputs
+        let json = JSONWriter()
+        json.object {
+            json.key("variables")
+            json.array(variables) { json.value($0) }
+            json.key("issues")
+            json.array(network.issues) { json.value($0) }
+            if variables.isEmpty || outputs.isEmpty {
+                json.field("message", "Tegn indgange (A, B …) og mindst én udgang (Y), og forbind dem med gates, så står sandhedstabellen her.")
+            } else if variables.count > LogicNetwork.maxVariables {
+                json.field("message", "Kredsløbet har \(variables.count) indgange. Sandhedstabellen laves for højst \(LogicNetwork.maxVariables).")
+            } else {
+                let table = network.truthTable()
+                let index = min(max(0, output), table.outputs.count - 1)
+                json.field("output", index)
+                json.key("outputs")
+                json.array(table.outputs) { column in
+                    json.object {
+                        json.field("name", column.name)
+                        json.key("values")
+                        json.array(column.values) { json.value($0.map { $0 ? "1" : "0" } ?? "?") }
+                    }
+                }
+                let column = table.outputs[index]
+                json.field("drawn", network.expression(for: outputs[index]).map { "\(column.name) = \($0.html)" })
+                json.field("canUseInCalculator", TruthTableSpec(table: table, output: index) != nil)
+                if column.values.allSatisfy({ $0 != nil }) {
+                    json.key("analysis")
+                    let analysis = LogicAnalysis(
+                        variables: table.variables, output: column.name,
+                        values: column.values.map { $0 == true ? .one : .zero }, form: LogicForm(rawValue: form) ?? .sumOfProducts
+                    )
+                    write(analysis, to: json)
+                }
+            }
+        }
+        return json.text
+    }
+
+    /// The calculator's truth table and its analysis, as JSON.
+    @JS func calculator() -> String {
+        let spec = editor.calculator
+        let json = JSONWriter()
+        json.object {
+            json.key("variables")
+            json.array(spec.variables) { json.value($0) }
+            json.field("outputName", spec.outputName)
+            json.field("form", spec.form.rawValue)
+            json.field("minVariables", TruthTableSpec.variableRange.lowerBound)
+            json.field("maxVariables", TruthTableSpec.variableRange.upperBound)
+            json.key("values")
+            json.array(spec.values) { json.value($0.rawValue) }
+            json.key("analysis")
+            write(spec.analysis, to: json)
+        }
+        return json.text
+    }
+
+    /// Changes the calculator: "count" (inputs), "name" (the output's),
+    /// "form", "cycle" (a row's value: 0 → 1 → X) or "fill" ("0", "1" or "X").
+    @JS func setCalculator(_ field: String, _ value: String) {
+        switch field {
+        case "count": if let count = Int(value) { editor.calculator.setVariableCount(count) }
+        case "name": editor.calculator.outputName = value
+        case "form": editor.calculator.form = LogicForm(rawValue: value) ?? .sumOfProducts
+        case "cycle": if let row = Int(value) { editor.calculator.cycle(row: row) }
+        case "fill": if let truth = TruthValue(rawValue: value) { editor.calculator.fill(truth) }
+        default: break
+        }
+    }
+
+    /// Puts an output's column of the drawn circuit's truth table into the calculator.
+    @JS func calculatorFromCircuit(_ output: Int, _ form: String) {
+        let table = editor.logicNetwork.truthTable()
+        guard var spec = TruthTableSpec(table: table, output: output) else { return }
+        spec.form = LogicForm(rawValue: form) ?? .sumOfProducts
+        editor.calculator = spec
+    }
+
+    /// Draws the calculator's circuit on the sheet. Returns whether it could.
+    @JS func drawCalculatorCircuit() -> Bool {
+        editor.insertCircuit(for: editor.calculator.analysis)
+    }
+
+    /// An analysis as JSON: the expression (HTML with lines over inverted
+    /// parts), the gates needed, the Karnaugh map with its groups and the steps.
+    private func write(_ analysis: LogicAnalysis, to json: JSONWriter) {
+        let theme = SheetTheme()
+        func css(_ color: SceneColor) -> String {
+            "rgb(\(Int(color.r * 255)), \(Int(color.g * 255)), \(Int(color.b * 255)))"
+        }
+        json.object {
+            json.field("output", analysis.output)
+            json.field("form", analysis.form.rawValue)
+            json.field("expression", "\(analysis.output) = \(analysis.expression.html)")
+            json.field("isConstant", analysis.isConstant)
+            json.field("groupCount", analysis.groups.count)
+            json.field("maxGroups", GateKind.inputRange.upperBound)
+            json.key("gates")
+            json.array(analysis.gateCounts) { json.value($0.text) }
+            if analysis.map == nil, analysis.variables.count > KarnaughMap.variableRange.upperBound {
+                json.field("mapNote", "Karnaugh-kort tegnes for 2–4 indgange. Med \(analysis.variables.count) indgange er udtrykket fundet med Quine–McCluskey.")
+            }
+            if let map = analysis.map {
+                json.key("map")
+                json.object {
+                    json.field("rowVariables", map.rowVariables.joined())
+                    json.field("columnVariables", map.columnVariables.joined())
+                    json.key("rowLabels")
+                    json.array(map.rowLabels) { json.value($0) }
+                    json.key("columnLabels")
+                    json.array(map.columnLabels) { json.value($0) }
+                    json.key("cells")
+                    json.array(map.cells) { row in
+                        json.array(row) { minterm in
+                            json.object {
+                                json.field("m", minterm)
+                                json.field("v", analysis.values[minterm].rawValue)
+                            }
+                        }
+                    }
+                    json.key("groups")
+                    json.array(Array(analysis.groups.enumerated())) { index, group in
+                        json.object {
+                            json.field("color", css(theme.groupColor(index)))
+                            json.field("inset", 3 + (index % 4) * 3)
+                            json.key("blocks")
+                            json.array(map.blocks(for: group.implicant)) { block in
+                                json.object {
+                                    json.field("row", block.row)
+                                    json.field("column", block.column)
+                                    json.field("rows", block.rows)
+                                    json.field("columns", block.columns)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            json.key("steps")
+            json.array(analysis.steps) { step in
+                json.object {
+                    json.field("text", step.text)
+                    json.field("expression", step.expression.map { step.prefix + $0.html })
+                    json.field("color", step.group.map { css(theme.groupColor($0)) })
+                }
+            }
+        }
+    }
+
     /// Maple code as MathML, which Maple pastes as 2-D Math.
     @JS func mapleMathML(_ code: String) -> String {
         MapleMathML.convert(code)
@@ -693,6 +1027,7 @@ enum SelectionKey {
         case .excludedArea(let id): "excludedArea:\(id)"
         case .meshMarker(let id): "meshMarker:\(id)"
         case .groupArea(let id): "groupArea:\(id)"
+        case .gate(let id): "gate:\(id)"
         case .group(let items): items.map(encode).sorted().joined(separator: "|")
         }
     }
@@ -720,6 +1055,7 @@ enum SelectionKey {
         case "excludedArea": return .excludedArea(id)
         case "meshMarker": return .meshMarker(id)
         case "groupArea": return .groupArea(id)
+        case "gate": return .gate(id)
         default: return nil
         }
     }

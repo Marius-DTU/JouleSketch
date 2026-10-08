@@ -28,7 +28,7 @@ import Foundation
 /// ```
 nonisolated enum MapleExporter {
     static func export(_ circuit: Circuit) -> String {
-        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches())
+        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches().resolvingZeroFrequencyGenerators())
         if !lowSide.isEmpty {
             let notes = lowSide.map { "# \($0.name) er en low-side udgang (LSO): et firkantsignal fra 0 V til \($0.openVoltage.map { SIValue.format($0, unit: "V") } ?? "?") (spændingen over den, når den er åben)" }
             return (notes + [export(circuit)]).joined(separator: "\n")
@@ -37,14 +37,29 @@ nonisolated enum MapleExporter {
             // Two scripts: the averages, then the fundamental with phasors.
             let average = circuit.averageCircuit()
             let solution = CircuitSolver.solve(average)
-            var writer = Writer(circuit: average)
+            let (split, notes) = splittingLEDs(average)
+            var writer = Writer(circuit: split)
             var fundamental = Writer(circuit: circuit.fundamentalCircuit(componentValues: solution.componentValues))
-            return ["# Del 1: middelværdier (signalets middelværdi, kondensatorer afbrudt, spoler kortsluttet)", writer.build(),
-                    "", "# Del 2: grundtonen (signalets første Fourier-led), andre kilder slukket",
-                    fundamental.build()].joined(separator: "\n")
+            let lines: [String] = ["# Del 1: middelværdier (signalets middelværdi, kondensatorer afbrudt, spoler kortsluttet)"] + notes
+                + [writer.build(), "", "# Del 2: grundtonen (signalets første Fourier-led), andre kilder slukket", fundamental.build()]
+            return lines.joined(separator: "\n")
         }
-        var writer = Writer(circuit: circuit)
-        return writer.build()
+        let (split, notes) = splittingLEDs(circuit)
+        var writer = Writer(circuit: split)
+        return (notes + [writer.build()]).joined(separator: "\n")
+    }
+
+    /// In DC each conducting LED as its model, a source V_K in series with its
+    /// internal resistance, and a note for each.
+    private static func splittingLEDs(_ circuit: Circuit) -> (Circuit, [String]) {
+        guard !circuit.isAC, circuit.components.contains(where: { $0.kind == .led }) else { return (circuit, []) }
+        let solution = CircuitSolver.solve(circuit)
+        let conducting = Set(circuit.components.filter { $0.kind == .led && solution.diodeConducts[$0.id] == true }.map(\.id))
+        let (split, resistors) = circuit.splittingLEDs(conducting: conducting)
+        let notes = circuit.components.compactMap { led in
+            resistors[led.id].map { "# \(led.name) leder og regnes som spændingskilden \(name(led.name)) (V_K) i serie med sin indre modstand \(name($0.name)) = \(SIValue.format($0.value, unit: "Ω"))" }
+        }
+        return (split, notes)
     }
 
     /// A user-entered or LaTeX name as a valid Maple name: V_{A} → V_A.

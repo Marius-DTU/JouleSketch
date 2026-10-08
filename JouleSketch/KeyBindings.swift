@@ -24,6 +24,20 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
     case text
     case mesh
     case groupArea
+    case andGate
+    case orGate
+    case notGate
+    case nandGate
+    case norGate
+    case xorGate
+    case xnorGate
+    case logicInput
+    case logicOutput
+    case logicBlock
+    case logicHigh
+    case logicLow
+    case invertPin
+    case leaveBlock
     case rotate
     case selectWholeWire
     /// ⌘-shortcuts used while typing in a text box.
@@ -46,6 +60,21 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
     /// Actions pressed with ⇧ as well as ⌘.
     var usesShift: Bool { self == .unitBrackets }
 
+    /// The kind of sheet the action belongs to, or `nil` for both. Actions
+    /// of different kinds of sheets may share a key.
+    var mode: SheetMode? {
+        switch tool {
+        case .component?, .ground?, .current?, .probe?, .power?, .equivalent?, .mesh?, .groupArea?: .analog
+        case .gate?, .invert?: .digital
+        default: self == .leaveBlock ? .digital : nil
+        }
+    }
+
+    /// Whether the action is used on a sheet of this kind.
+    func applies(to mode: SheetMode) -> Bool {
+        self.mode == nil || self.mode == mode
+    }
+
     /// The modifier keys shown before the key in the settings, e.g. "⌘⇧".
     var modifierSymbols: String {
         (usesCommand ? "⌘" : "") + (usesShift ? "⇧" : "")
@@ -55,6 +84,7 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .rotate: "Rotér / vend retning"
         case .selectWholeWire: "Markér hele ledningen"
+        case .leaveBlock: "Gå ud af blokken"
         case .textMode: "Tekstfelt: tekst"
         case .mathMode: "Tekstfelt: math (LaTeX)"
         case .evaluateMath: "Tekstfelt: udregn"
@@ -86,7 +116,20 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
         case .text: .text
         case .mesh: .mesh
         case .groupArea: .groupArea
-        case .rotate, .selectWholeWire, .textMode, .mathMode, .evaluateMath, .unitBrackets: nil
+        case .andGate: .gate(.and)
+        case .orGate: .gate(.or)
+        case .notGate: .gate(.not)
+        case .nandGate: .gate(.nand)
+        case .norGate: .gate(.nor)
+        case .xorGate: .gate(.xor)
+        case .xnorGate: .gate(.xnor)
+        case .logicInput: .gate(.input)
+        case .logicOutput: .gate(.output)
+        case .logicBlock: .gate(.block)
+        case .logicHigh: .gate(.high)
+        case .logicLow: .gate(.low)
+        case .invertPin: .invert
+        case .rotate, .selectWholeWire, .leaveBlock, .textMode, .mathMode, .evaluateMath, .unitBrackets: nil
         }
     }
 
@@ -112,6 +155,20 @@ enum KeyAction: String, CaseIterable, Identifiable, Codable {
         case .text: "t"
         case .mesh: "m"
         case .groupArea: "k"
+        case .andGate: "a"
+        case .orGate: "o"
+        case .notGate: "n"
+        case .nandGate: "7"
+        case .norGate: "8"
+        case .xorGate: "x"
+        case .xnorGate: "9"
+        case .logicInput: "1"
+        case .logicOutput: "2"
+        case .logicBlock: "3"
+        case .logicHigh: "5"
+        case .logicLow: "g"
+        case .invertPin: "i"
+        case .leaveBlock: "e"
         case .rotate: "r"
         case .selectWholeWire: "u"
         case .textMode: "t"
@@ -131,17 +188,18 @@ struct KeyBindings: Codable, Equatable {
         set { keys[action] = newValue.lowercased() }
     }
 
-    /// The action bound to a typed key, if any.
-    func action(for key: String) -> KeyAction? {
+    /// The action bound to a typed key on a sheet of the given kind, if any.
+    func action(for key: String, mode: SheetMode) -> KeyAction? {
         let key = key.lowercased()
-        return KeyAction.allCases.first { !$0.usesCommand && !self[$0].isEmpty && self[$0] == key }
+        return KeyAction.allCases.first { !$0.usesCommand && $0.applies(to: mode) && !self[$0].isEmpty && self[$0] == key }
     }
 
-    /// Actions sharing their key with another action.
+    /// Actions sharing their key with another action used on the same kind of sheet.
     var conflicts: Set<KeyAction> {
         var result = Set<KeyAction>()
         for a in KeyAction.allCases {
-            for b in KeyAction.allCases where a != b && a.modifierSymbols == b.modifierSymbols && !self[a].isEmpty && self[a] == self[b] {
+            for b in KeyAction.allCases where a != b && a.modifierSymbols == b.modifierSymbols && !self[a].isEmpty && self[a] == self[b]
+                && (a.mode == nil || b.mode == nil || a.mode == b.mode) {
                 result.insert(a)
             }
         }

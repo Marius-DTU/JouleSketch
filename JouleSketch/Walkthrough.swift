@@ -23,6 +23,8 @@ nonisolated enum WalkMethod: String, CaseIterable, Identifiable {
     case nodal
     case mesh
     case superposition
+    /// How each equivalent resistance (Req) on the sheet is found.
+    case equivalent
 
     var id: String { rawValue }
 
@@ -31,7 +33,19 @@ nonisolated enum WalkMethod: String, CaseIterable, Identifiable {
         case .nodal: "Knudepunkt"
         case .mesh: "Maske"
         case .superposition: "Superposition"
+        case .equivalent: "Samlet modstand"
         }
+    }
+
+    /// The heading shown when the method can't be used.
+    var unavailableTitle: String {
+        self == .equivalent ? "Den samlede modstand kan ikke findes" : "\(title)smetoden kan ikke bruges"
+    }
+
+    /// The methods offered for a circuit: the equivalent resistance only
+    /// when one is drawn.
+    static func available(for circuit: Circuit) -> [WalkMethod] {
+        allCases.filter { $0 != .equivalent || !circuit.equivalents.isEmpty }
     }
 }
 
@@ -704,7 +718,8 @@ nonisolated enum WalkError: Error {
 
 nonisolated enum Walkthrough {
     static func make(_ method: WalkMethod, for circuit: Circuit) -> WalkResult {
-        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches())
+        if method == .equivalent { return EquivalentWalkthrough.make(for: circuit) }
+        let (circuit, lowSide) = CircuitSolver.resolvingLowSideOutputs(circuit.resolvingSwitches().resolvingZeroFrequencyGenerators())
         if !lowSide.isEmpty {
             var lines: [WalkLine] = []
             for output in lowSide {
@@ -742,11 +757,22 @@ nonisolated enum Walkthrough {
             .text("1: For hver diode gættes ON eller OFF."),
             .text("2: Modellen sættes ind på diodens plads: ON er en spændingskilde V_K med + ved anoden (strømmen I_d), OFF er en afbrydelse (spændingen V_d)."),
         ]
+        if diodes.contains(where: { $0.kind == .led }) {
+            guess.append(.text("En lysdiode (LED) har også en indre modstand r_d = \(SIValue.format(LEDModel.resistance, unit: "Ω")) i serie med V_K, så ON giver V_d = V_K + r_d · I_d."))
+        }
+        var ledsOn = Set<UUID>()
         var check: [WalkLine] = [.text("4: Gættet kontrolleres: Id > 0 for ON og Vd < VK for OFF.")]
         for diode in diodes {
             let vk = diode.value ?? 0
             let values = solution.diodeValues[diode.id] ?? (0, 0)
             let name = WalkFormat.name(diode.name)
+            if diode.kind == .led, solution.diodeConducts[diode.id] == true {
+                // Split into V_K and r_d below.
+                ledsOn.insert(diode.id)
+                guess.append(.math("\(name):\\; \\text{ON} \\Rightarrow V_{d} = V_{K} + r_{d} I_{d} = \(WalkFormat.quantity(vk, .volt)) + \(WalkFormat.quantity(LEDModel.resistance, .ohm)) \\cdot I_{d}"))
+                check.append(.math("I_{\(diode.name)} = \(WalkFormat.quantity(values.current, .ampere)) > 0 \\;\\checkmark"))
+                continue
+            }
             linear.components.removeAll { $0.id == diode.id }
             if solution.diodeConducts[diode.id] == true {
                 // + at the anode (start); a voltage source has + at its end.
@@ -760,6 +786,7 @@ nonisolated enum Walkthrough {
                 check.append(.math("V_{\(diode.name)} = \(WalkFormat.quantity(values.voltage, .volt)) < V_{K} = \(WalkFormat.quantity(vk, .volt)) \\;\\checkmark"))
             }
         }
+        linear = linear.splittingLEDs(conducting: ledsOn).circuit
         guess.append(.text("3: Kredsløbet regnes som normalt med modellerne indsat:"))
         check.append(.text("5: Alle betingelser er opfyldt, så gættet holder (ellers OMMER med et nyt gæt)."))
 
@@ -845,6 +872,7 @@ nonisolated enum Walkthrough {
             case .nodal: return NodalWalkthrough.make(model)
             case .mesh: return MeshWalkthrough.make(model)
             case .superposition: return SuperpositionWalkthrough.make(model)
+            case .equivalent: return EquivalentWalkthrough.make(for: circuit)
             }
         }
     }

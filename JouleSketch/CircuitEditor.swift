@@ -31,10 +31,18 @@ enum Tool: Hashable, CaseIterable, Identifiable {
     case mesh
     /// Draws a named, tinted box that groups part of the sheet for the Maple window.
     case groupArea
+    /// Places a logic gate, input or output (digital sheets).
+    case gate(GateKind)
+    /// Puts an inverting circle on a gate's input or output, or takes it away.
+    case invert
 
-    /// In palette order, group by group.
+    /// In palette order, group by group, each tool once.
     static var allCases: [Tool] {
-        ToolGroup.allCases.flatMap(\.tools)
+        var tools: [Tool] = []
+        for tool in ToolGroup.allCases.flatMap(\.tools) where !tools.contains(tool) {
+            tools.append(tool)
+        }
+        return tools
     }
 
     var id: String {
@@ -50,6 +58,8 @@ enum Tool: Hashable, CaseIterable, Identifiable {
         case .text: "text"
         case .mesh: "mesh"
         case .groupArea: "groupArea"
+        case .gate(let kind): "gate-" + kind.rawValue
+        case .invert: "invert"
         }
     }
 
@@ -71,6 +81,8 @@ enum Tool: Hashable, CaseIterable, Identifiable {
         case .text: "Tekst og udregning"
         case .mesh: "Maskestrøm"
         case .groupArea: "Gruppe"
+        case .gate(let kind): kind.displayName
+        case .invert: "Invertér indgang eller udgang"
         }
     }
 }
@@ -87,8 +99,27 @@ enum ToolGroup: String, CaseIterable, Identifiable {
     case ground
     case analysis
     case notes
+    /// The buttons of a digital sheet.
+    case logicWire
+    case gates
+    case logicIO
+    case logicSupply
+    case logicBlock
+    case logicInvert
+    case logicNotes
 
     var id: String { rawValue }
+
+    /// The buttons of the palette on an analog or a digital sheet.
+    /// Inside a block there are no inputs and outputs to place: they are
+    /// the block's terminals.
+    static func palette(for mode: SheetMode, insideBlock: Bool = false) -> [ToolGroup] {
+        switch mode {
+        case .analog: [.select, .wire, .resistor, .sources, .diodes, .ground, .analysis, .notes]
+        case .digital where insideBlock: [.select, .logicWire, .gates, .logicSupply, .logicBlock, .logicInvert, .logicNotes]
+        case .digital: [.select, .logicWire, .gates, .logicIO, .logicSupply, .logicBlock, .logicInvert, .logicNotes]
+        }
+    }
 
     var title: String {
         switch self {
@@ -100,6 +131,13 @@ enum ToolGroup: String, CaseIterable, Identifiable {
         case .ground: "Stel"
         case .analysis: "Mål og beregn"
         case .notes: "Noter"
+        case .logicWire: "Ledning"
+        case .gates: "Logiske gates"
+        case .logicIO: "Indgange og udgange"
+        case .logicSupply: "5V og GND"
+        case .logicBlock: "Blok"
+        case .logicInvert: "Invertér"
+        case .logicNotes: "Tekst"
         }
     }
 
@@ -114,6 +152,13 @@ enum ToolGroup: String, CaseIterable, Identifiable {
         case .ground: [.ground]
         case .analysis: [.probe, .current, .mesh, .power, .equivalent]
         case .notes: [.text, .groupArea]
+        case .logicWire: [.wire]
+        case .gates: GateKind.gates.map { .gate($0) }
+        case .logicIO: [.gate(.input), .gate(.output)]
+        case .logicSupply: [.gate(.high), .gate(.low)]
+        case .logicBlock: [.gate(.block)]
+        case .logicInvert: [.invert]
+        case .logicNotes: [.text]
         }
     }
 
@@ -150,6 +195,8 @@ nonisolated enum Selection: Hashable {
     case meshMarker(UUID)
     /// A named box grouping part of the sheet.
     case groupArea(UUID)
+    /// A logic gate, input or output.
+    case gate(UUID)
     /// Several items selected with an area selection
     /// (components, whole wires and probes).
     case group(Set<Selection>)
@@ -180,8 +227,30 @@ final class CircuitEditor {
         }
     }
 
+    /// How many symbol editors are open. While one is, values typed into it
+    /// aren't worked out until it closes (Færdig), not on every keystroke.
+    private var calculationPauses = 0
+    /// Whether the circuit changed while the calculation was paused.
+    private var needsCalculation = false
+
+    /// Holds the calculation back, e.g. while a symbol's editor is open.
+    func pauseCalculation() {
+        calculationPauses += 1
+    }
+
+    /// Lets the calculation run again, and catches up on what changed.
+    func resumeCalculation() {
+        calculationPauses = max(0, calculationPauses - 1)
+        if calculationPauses == 0, needsCalculation { recalculate() }
+    }
+
     /// Solves the circuit again, with the push buttons held down right now.
     private func recalculate() {
+        guard calculationPauses == 0 else {
+            needsCalculation = true
+            return
+        }
+        needsCalculation = false
         // What lies in an excluded area doesn't take part.
         let calculated = circuit.excludingAreas().resolvingSwitches(pressed: pressedButtons)
         solution = CircuitSolver.solve(calculated)
@@ -191,6 +260,327 @@ final class CircuitEditor {
                 between: $0.start, and: $0.end, in: calculated, netlist: netlist, solution: solution
             ))
         })
+        logicNetwork = LogicNetwork(circuit)
+        logicValues = logicNetwork.evaluate(inputValues)
+    }
+
+    // MARK: Digital sheets
+
+    /// Analog or digital; a sheet without a choice yet counts as analog.
+    var sheetMode: SheetMode { circuit.sheetMode }
+    var isDigital: Bool { sheetMode == .digital }
+
+    /// Whether the start page should be shown: a new, empty document that
+    /// hasn't been made analog or digital yet.
+    var needsModeChoice: Bool { circuit.mode == nil && circuit.isEmpty }
+
+    /// Makes the document analog or digital (from the start page). Not an
+    /// undo step, so undoing doesn't bring the start page back.
+    func chooseMode(_ mode: SheetMode) {
+        var chosen = circuit
+        chosen.mode = mode
+        circuit = chosen
+        tool = .wire
+        selection = nil
+    }
+
+    /// The nets of the gates and what drives them.
+    private(set) var logicNetwork = LogicNetwork(Circuit())
+    /// The value of every net for the inputs as they are set now.
+    private(set) var logicValues: [Int: Bool] = [:]
+
+    /// The inputs' values by name.
+    private var inputValues: [String: Bool] {
+        var values: [String: Bool] = [:]
+        for gate in circuit.gates where gate.kind == .input {
+            values[gate.name] = (values[gate.name] ?? false) || gate.isHigh == true
+        }
+        return values
+    }
+
+    /// Whether the signal on a wire is 1 right now (`nil` if it has none).
+    func isWireHigh(_ wire: Wire) -> Bool? {
+        logicNetwork.netOf[wire.start].flatMap { logicValues[$0] }
+    }
+
+    /// The value an output (or a gate's output) shows right now.
+    func logicValue(of gate: LogicGate) -> Bool? {
+        switch gate.kind {
+        case .output: logicNetwork.value(of: gate, in: logicValues)
+        case .input: gate.isHigh == true
+        default: gate.outputPoint.flatMap { logicNetwork.netOf[$0] }.flatMap { logicValues[$0] }
+        }
+    }
+
+    func gate(id: UUID) -> LogicGate? {
+        circuit.gates.first { $0.id == id }
+    }
+
+    /// The input at a hit, if that's what it is (clicking it switches it).
+    func logicInput(_ hit: Selection?) -> LogicGate? {
+        guard case .gate(let id)? = hit, let gate = gate(id: id), gate.kind == .input else { return nil }
+        return gate
+    }
+
+    /// Places a gate, input, output or block with its inputs (or terminal) at `position`.
+    func addGate(_ kind: GateKind, at position: GridPoint) {
+        guard !isBlockTerminal(kind) else { return }
+        checkpoint()
+        let gate = newGate(kind, at: position)
+        circuit.gates.append(gate)
+        selection = .gate(gate.id)
+    }
+
+    /// The gate a gate tool places at `position` (also drawn as its ghost):
+    /// with the next free name, and for a block the library block picked.
+    func newGate(_ kind: GateKind, at position: GridPoint) -> LogicGate {
+        if kind == .block, var block = blockTemplate {
+            block.id = UUID()
+            block.position = position
+            block.rotation = placementRotation
+            return block
+        }
+        let name = switch kind {
+        case .input: circuit.nextInputName()
+        case .output: circuit.nextOutputName()
+        case .block: circuit.nextBlockName()
+        default: ""
+        }
+        return LogicGate(kind: kind, position: position, rotation: placementRotation, name: name)
+    }
+
+    /// Picks the block tool with a block from the library, so clicks place copies of it.
+    func placeFromLibrary(_ entry: BlockLibrary.Entry) {
+        isDrawing = false
+        tool = .gate(.block)
+        blockTemplate = entry.block
+    }
+
+    // MARK: Blocks' sub-diagrams
+
+    /// The blocks whose sheet is being edited, from the document's own sheet
+    /// inwards; empty on the document's sheet.
+    private(set) var blockPath: [UUID] = []
+    /// The sheets around the one being edited, outermost first. The block
+    /// being edited inside each one gets its contents back on the way out.
+    private var outerCircuits: [Circuit] = []
+    /// How each outer sheet was zoomed and panned, to come back to it.
+    private var outerViews: [(scale: CGFloat, offset: CGSize)] = []
+
+    /// Whether the sheet being edited is a block's sub-diagram.
+    var isInsideBlock: Bool { !blockPath.isEmpty }
+
+    /// Inside a block its inputs and outputs are its terminals, set in the
+    /// block's properties, so they can't be placed or renamed there.
+    private func isBlockTerminal(_ kind: GateKind) -> Bool {
+        isInsideBlock && (kind == .input || kind == .output)
+    }
+
+    /// The names on the way in: "Ark" for the document's own sheet, then each block.
+    var blockTrail: [String] {
+        ["Ark"] + zip(outerCircuits, blockPath).map { outer, id in
+            outer.gates.first { $0.id == id }.map { $0.name.isEmpty ? "Blok" : $0.name } ?? "Blok"
+        }
+    }
+
+    /// The whole document, with the sheet being edited put back into the
+    /// blocks around it. This is what's saved.
+    var documentCircuit: Circuit { document(withSheet: circuit) }
+
+    /// The document with `sheet` as the contents of the block being edited.
+    private func document(withSheet sheet: Circuit) -> Circuit {
+        var inner = sheet
+        for (outer, id) in zip(outerCircuits, blockPath).reversed() {
+            var outer = outer
+            outer.setContents(inner, ofBlock: id)
+            inner = outer
+        }
+        return inner
+    }
+
+    /// Shows the sheet at `path` in a document (the blocks to go into from
+    /// its own sheet), as far as those blocks are still there.
+    private func show(document: Circuit, path: [UUID]) {
+        var outer: [Circuit] = []
+        var found: [UUID] = []
+        var sheet = document
+        for id in path {
+            guard let block = sheet.gates.first(where: { $0.id == id && $0.kind == .block }) else { break }
+            outer.append(sheet)
+            found.append(id)
+            sheet = block.subcircuit ?? Self.emptyBlockSheet
+        }
+        if found != blockPath {
+            selection = nil
+            outerViews = Array(outerViews.prefix(found.count))
+            while outerViews.count < found.count { outerViews.append((scale, offset)) }
+        }
+        outerCircuits = outer
+        blockPath = found
+        circuit = sheet
+    }
+
+    private static var emptyBlockSheet: Circuit {
+        var sheet = Circuit()
+        sheet.mode = .digital
+        return sheet
+    }
+
+    /// Opens a block's sub-diagram, where what the block does is built. A
+    /// new one gets an input and an output for each of the block's terminals.
+    func enterBlock(id: UUID) {
+        guard let block = gate(id: id), block.kind == .block else { return }
+        // An open symbol editor's changes are an undo step on this sheet.
+        endEdit()
+        finishWire()
+        var inside = block.subcircuit ?? Self.emptyBlockSheet
+        inside.matchTerminals(of: block)
+        outerCircuits.append(circuit)
+        outerViews.append((scale, offset))
+        blockPath.append(id)
+        circuit = inside
+        selection = nil
+        pendingEquivalentPoint = nil
+        resetView()
+        undoVersion += 1
+    }
+
+    /// Goes into the block if `item` is one (a double-click on it). Returns whether it did.
+    func enterIfBlock(_ item: Selection) -> Bool {
+        guard case .gate(let id) = item, gate(id: id)?.kind == .block else { return false }
+        enterBlock(id: id)
+        return true
+    }
+
+    /// Goes back out of `levels` blocks (all the way with `Int.max`). The
+    /// block left is selected on the sheet around it.
+    func leaveBlock(levels: Int = 1) {
+        guard isInsideBlock else { return }
+        endEdit()
+        finishWire()
+        for _ in 0..<min(levels, blockPath.count) {
+            let id = blockPath.removeLast()
+            var outer = outerCircuits.removeLast()
+            let view = outerViews.removeLast()
+            outer.setContents(circuit, ofBlock: id)
+            circuit = outer
+            scale = view.scale
+            setOffset(view.offset)
+            selection = .gate(id)
+        }
+        pendingEquivalentPoint = nil
+        undoVersion += 1
+    }
+
+    /// Goes out to the sheet at `index` of `blockTrail` (0: the document's own).
+    func leaveBlock(toLevel index: Int) {
+        leaveBlock(levels: blockPath.count - max(0, index))
+    }
+
+    /// The terminal nearest to a point (world points) within `tolerance`, that
+    /// the inverter tool would put a circle on: the gate, the terminal and
+    /// where its circle is (grid units).
+    func invertiblePin(near point: CGPoint, tolerance: CGFloat) -> (gate: UUID, pin: LogicGate.Pin, center: CGPoint)? {
+        let spacing = Self.gridSpacing
+        var best: (gate: UUID, pin: LogicGate.Pin, center: CGPoint, distance: CGFloat)?
+        // 5V and GND are a fixed 1 and 0; there's nothing to invert.
+        for gate in circuit.gates where !gate.kind.isConstant {
+            for (pin, terminal) in gate.pins {
+                let local = gate.bubbleCenter(pin)
+                let center = gate.point(local.x, local.y)
+                let world = CGPoint(x: center.x * spacing, y: center.y * spacing)
+                let end = CGPoint(x: CGFloat(terminal.x) * spacing, y: CGFloat(terminal.y) * spacing)
+                let distance = point.distance(toSegment: end, world)
+                if distance <= max(tolerance, spacing * 0.45), distance < (best?.distance ?? .infinity) {
+                    best = (gate.id, pin, center, distance)
+                }
+            }
+        }
+        return best.map { ($0.gate, $0.pin, $0.center) }
+    }
+
+    /// A click with the inverter tool: inverts the terminal under the point
+    /// with a small circle, or takes the circle away again.
+    func toggleInversion(near point: CGPoint, tolerance: CGFloat) {
+        guard let hit = invertiblePin(near: point, tolerance: tolerance),
+              let index = circuit.gates.firstIndex(where: { $0.id == hit.gate }) else { return }
+        checkpoint()
+        circuit.gates[index].toggleInversion(hit.pin)
+        selection = .gate(hit.gate)
+    }
+
+    /// Switches an input between 0 and 1, and every input of the same name with it.
+    func toggleInput(id: UUID) {
+        guard let input = gate(id: id), input.kind == .input else { return }
+        let high = input.isHigh != true
+        edit {
+            for index in circuit.gates.indices where circuit.gates[index].kind == .input && circuit.gates[index].name == input.name {
+                circuit.gates[index].isHigh = high ? true : nil
+            }
+        }
+    }
+
+    /// Changes a gate; wires attached to it follow its terminals.
+    func updateGate(id: UUID, _ change: (inout LogicGate) -> Void) {
+        guard let old = gate(id: id) else { return }
+        var gate = old
+        change(&gate)
+        if isBlockTerminal(gate.kind) { gate.name = old.name }
+        gate.renameInsideTerminals(from: old)
+        gate.inputCount = gate.kind.allowsMoreInputs
+            ? min(GateKind.inputRange.upperBound, max(GateKind.inputRange.lowerBound, gate.inputCount))
+            : gate.kind == .block ? gate.inputOffsets.count : gate.kind.defaultInputCount
+        let offsets = Set(gate.inputOffsets)
+        gate.invertedInputs = gate.invertedInputs.map { $0.filter(offsets.contains) }.flatMap { $0.isEmpty ? nil : $0 }
+        let outputRows = Set(gate.blockOutputRows)
+        gate.invertedOutputs = gate.invertedOutputs.map { $0.filter(outputRows.contains) }.flatMap { $0.isEmpty ? nil : $0 }
+        undoableEdit {
+            var updated = circuit
+            updated.moveComponents([:], gates: [id: gate])
+            circuit = updated
+        }
+    }
+
+    /// Turns a gate 90° clockwise around its first point.
+    func rotateGate(id: UUID) {
+        updateGate(id: id) { $0.rotation = ($0.rotation + 1) % 4 }
+    }
+
+    /// Moves an input (or, with `isOutput`, an output) of the drawn circuit's
+    /// truth table to another column. The order is kept in the document.
+    func moveLogicColumn(from source: Int, to destination: Int, isOutput: Bool) {
+        var variables = logicNetwork.variables
+        var outputs = logicNetwork.outputs.map(\.name)
+        func move(_ list: inout [String]) {
+            guard list.indices.contains(source), list.indices.contains(destination), source != destination else { return }
+            list.insert(list.remove(at: source), at: destination)
+        }
+        if isOutput { move(&outputs) } else { move(&variables) }
+        edit { circuit.logicColumnOrder = variables + outputs }
+    }
+
+    /// The truth table typed into the calculator. Not part of the document.
+    var calculator = TruthTableSpec()
+
+    /// Draws the gates for an analysis to the right of what's on the sheet,
+    /// and selects them. Returns `false` if there's nothing to draw (the
+    /// function is constant) or too much (more than eight groups).
+    @discardableResult
+    func insertCircuit(for analysis: LogicAnalysis) -> Bool {
+        let name = circuit.gates.contains { $0.kind == .output && $0.name == analysis.output } ? circuit.nextOutputName() : analysis.output
+        var right = 0
+        for gate in circuit.gates { right = max(right, Int(gate.bounds.maxX.rounded(.up))) }
+        for wire in circuit.wires { right = max(right, wire.points.map(\.x).max() ?? 0) }
+        for box in circuit.textBoxes { right = max(right, box.position.x + Int(textBoxRect(box).width / Self.gridSpacing)) }
+        let origin = GridPoint(x: circuit.isEmpty ? 4 : right + 6, y: 5)
+        guard let layout = LogicSynthesis.layout(analysis, at: origin, outputName: name) else { return false }
+        finishWire()
+        checkpoint()
+        circuit.gates += layout.gates
+        circuit.wires += layout.wires
+        tool = .select
+        selection = Self.selection(of: Set(layout.gates.map { .gate($0.id) } + layout.wires.map { .wire($0.id) }))
+        return true
     }
 
     // MARK: Switches and push buttons
@@ -212,6 +602,14 @@ final class CircuitEditor {
     func switchComponent(_ hit: Selection?) -> CircuitComponent? {
         guard case .component(let id)? = hit, let component = component(id: id), component.kind.isSwitch else { return nil }
         return component
+    }
+
+    /// Gives an LED a color, and the knee voltage that goes with it.
+    func setLEDColor(_ color: LEDColor, id: UUID) {
+        updateComponent(id: id) {
+            $0.color = color == .red ? nil : color
+            $0.value = color.kneeVoltage
+        }
     }
 
     /// Opens a closed switch and closes an open one.
@@ -247,6 +645,23 @@ final class CircuitEditor {
 
     /// Values filled in by the automatic calculation, and what's missing.
     private(set) var solution = CircuitSolution()
+    /// Whether values or LEDs change with a signal generator, so the sheet
+    /// has to be redrawn as they do.
+    var isAnimated: Bool { solution.isAnimated }
+
+    /// Whether a voltage point or current shows its value right now while a
+    /// signal generator slowly changes it, so the sheet is redrawn often.
+    var hasContinuousMeasurement: Bool {
+        func live(_ id: UUID, _ mode: MeasureMode?) -> Bool {
+            mode == .instant && solution.signalFrequency[id].map { $0 < SignalTimeline.steadyFrequency } == true
+        }
+        return circuit.probes.contains { live($0.id, $0.measure) } || circuit.currents.contains { live($0.id, $0.measure) }
+    }
+
+    /// When the sheet next needs redrawing after `time` (seconds), or `nil`.
+    func nextRedraw(after time: Double) -> Double? {
+        solution.nextRedraw(after: time, continuous: hasContinuousMeasurement)
+    }
     /// The nodes of the circuit.
     private(set) var netlist = Netlist(Circuit())
     /// The value of each equivalent resistance (Req), by id.
@@ -261,8 +676,16 @@ final class CircuitEditor {
                 placesVoltageDrops = false
             }
             lastTools[tool.group] = tool
+            // Picking a tool places plain blocks again; a library block is
+            // picked with `placeFromLibrary`, which sets the template after.
+            blockTemplate = nil
+            // A block's inputs and outputs come from its terminals.
+            if case .gate(let kind) = tool, isBlockTerminal(kind) { tool = .select }
         }
     }
+
+    /// The library block the block tool places, or `nil` for a new, plain block.
+    private(set) var blockTemplate: LogicGate?
 
     /// The tool last used in each palette group.
     private(set) var lastTools: [ToolGroup: Tool] = [:]
@@ -316,6 +739,9 @@ final class CircuitEditor {
 
     /// Replaces the whole circuit, e.g. when a file is opened. Not undoable.
     func load(_ circuit: Circuit) {
+        blockPath = []
+        outerCircuits = []
+        outerViews = []
         self.circuit = circuit
         routing = []
         selection = nil
@@ -375,16 +801,23 @@ final class CircuitEditor {
         registerUndo(restoring: circuit)
     }
 
-    /// Registers an undo step that restores `previous`. Undoing registers the
-    /// opposite step, which the undo manager turns into redo.
+    /// Registers an undo step that restores `previous` on the sheet being
+    /// edited. The step keeps the whole document and which block's sheet it
+    /// was made on, so undoing works the same inside and outside blocks.
     private func registerUndo(restoring previous: Circuit) {
+        registerUndo(document: document(withSheet: previous), path: blockPath)
+    }
+
+    /// Undoing registers the opposite step, which the undo manager turns into redo.
+    private func registerUndo(document: Circuit, path: [UUID]) {
         undoManager?.registerUndo(withTarget: self) { editor in
             MainActor.assumeIsolated {
-                let current = editor.circuit
-                editor.circuit = previous
+                let current = editor.documentCircuit
+                let currentPath = editor.blockPath
+                editor.show(document: document, path: path)
                 editor.routing = []
                 editor.validateSelection()
-                editor.registerUndo(restoring: current)
+                editor.registerUndo(document: current, path: currentPath)
             }
         }
         undoVersion += 1
@@ -400,17 +833,30 @@ final class CircuitEditor {
 
     /// Call when an editor for names, values or notes opens, so all its
     /// changes can be undone in one step.
+    /// What's typed in isn't worked out until the editor closes (Færdig).
     func beginEdit() {
         editSnapshot = circuit
+        if !isEditPaused {
+            isEditPaused = true
+            pauseCalculation()
+        }
     }
 
-    /// Call when the editor closes. Records one undo step if anything changed.
+    /// Call when the editor closes. Records one undo step if anything
+    /// changed, and works out what was typed in.
     func endEdit() {
         if let editSnapshot, editSnapshot != circuit {
             registerUndo(restoring: editSnapshot)
         }
         editSnapshot = nil
+        if isEditPaused {
+            isEditPaused = false
+            resumeCalculation()
+        }
     }
+
+    /// Whether an open editor holds the calculation back.
+    private var isEditPaused = false
 
     func undo() {
         undoManager?.undo()
@@ -445,6 +891,7 @@ final class CircuitEditor {
         case .excludedArea(let id): circuit.excludedAreas.contains { $0.id == id }
         case .meshMarker(let id): circuit.meshMarkers.contains { $0.id == id }
         case .groupArea(let id): circuit.groupAreas.contains { $0.id == id }
+        case .gate(let id): circuit.gates.contains { $0.id == id }
         case .group(let items): items.contains { exists($0) }
         }
     }
@@ -516,6 +963,7 @@ final class CircuitEditor {
         items.formUnion(circuit.senses.map { .sense($0.id) })
         items.formUnion(circuit.equivalents.map { .equivalent($0.id) })
         items.formUnion(circuit.textBoxes.map { .textBox($0.id) })
+        items.formUnion(circuit.gates.map { .gate($0.id) })
         selection = Self.selection(of: items)
     }
 
@@ -553,6 +1001,11 @@ final class CircuitEditor {
         }
         for group in circuit.groupAreas where inside(group.from) && inside(group.to) {
             items.insert(.groupArea(group.id))
+        }
+        for gate in circuit.gates {
+            let bounds = gate.bounds
+            let world = CGRect(x: bounds.minX * spacing, y: bounds.minY * spacing, width: bounds.width * spacing, height: bounds.height * spacing)
+            if rect.contains(world) { items.insert(.gate(gate.id)) }
         }
         for marker in circuit.senses where rect.contains(CGPoint(x: marker.x * spacing, y: marker.y * spacing)) {
             items.insert(.sense(marker.id))
@@ -703,6 +1156,9 @@ final class CircuitEditor {
             finishWire()
         } else if pendingEquivalentPoint != nil {
             pendingEquivalentPoint = nil
+        } else if tool == .select, isInsideBlock {
+            // With nothing else to stop, Esc goes back out of a block.
+            leaveBlock()
         } else {
             tool = .select
         }
@@ -729,7 +1185,7 @@ final class CircuitEditor {
             return
         }
         switch tool {
-        case .component, .ground:
+        case .component, .ground, .gate:
             placementRotation = (placementRotation + 1) % 4
         case .mesh:
             meshPlacementClockwise.toggle()
@@ -739,6 +1195,7 @@ final class CircuitEditor {
             case .currentArrow(let id): flipCurrentArrow(id: id)
             case .ground(let id): rotateGround(id: id)
             case .sense(let id): flipSense(id: id)
+            case .gate(let id): rotateGate(id: id)
             default: break
             }
         }
@@ -1351,6 +1808,7 @@ final class CircuitEditor {
             case .excludedArea(let id): copied.excludedAreas += circuit.excludedAreas.filter { $0.id == id }
             case .meshMarker(let id): copied.meshMarkers += circuit.meshMarkers.filter { $0.id == id }
             case .groupArea(let id): copied.groupAreas += circuit.groupAreas.filter { $0.id == id }
+            case .gate(let id): copied.gates += circuit.gates.filter { $0.id == id }
             case .sense(let id):
                 if let owner = circuit.senses.first(where: { $0.id == id })?.ownerID { componentIDs.insert(owner) }
             case .currentArrow, .group: break
@@ -1366,7 +1824,7 @@ final class CircuitEditor {
                 copied.wires.append(Wire(points: [wire.points[segment], wire.points[segment + 1]]))
             }
         }
-        guard copied != Circuit() else { return }
+        guard !copied.isEmpty else { return }
         Self.clipboard = copied
         pasteCount = 0
     }
@@ -1470,6 +1928,15 @@ final class CircuitEditor {
             circuit.groupAreas.append(group)
             items.insert(.groupArea(group.id))
         }
+        // Inputs keep their names, so they stay the same signal; outputs get free ones.
+        for var gate in pasted.gates {
+            gate.id = UUID()
+            if gate.kind == .output, circuit.gates.contains(where: { $0.kind == .output && $0.name == gate.name }) {
+                gate.name = circuit.nextOutputName()
+            }
+            circuit.gates.append(gate)
+            items.insert(.gate(gate.id))
+        }
         tool = .select
         selection = Self.selection(of: items)
     }
@@ -1500,6 +1967,7 @@ final class CircuitEditor {
         case .excludedArea(let id): circuit.excludedAreas.removeAll { $0.id == id }
         case .meshMarker(let id): circuit.meshMarkers.removeAll { $0.id == id }
         case .groupArea(let id): circuit.groupAreas.removeAll { $0.id == id }
+        case .gate(let id): circuit.gates.removeAll { $0.id == id }
         case .sense, .senseLabel: break  // Sense markers go with their source.
         case .group(let items):
             // Segments of the same wire are removed together, since removing
@@ -1639,6 +2107,10 @@ final class CircuitEditor {
             guard let index = moved.groupAreas.firstIndex(where: { $0.id == id }) else { return }
             moved.groupAreas[index].from = moved.groupAreas[index].from + offset
             moved.groupAreas[index].to = moved.groupAreas[index].to + offset
+        case .gate(let id):
+            guard var gate = moved.gates.first(where: { $0.id == id }) else { return }
+            gate.position = gate.position + offset
+            moved.moveComponents([:], gates: [id: gate])
         case .group(let items):
             moveGroup(items, by: offset, in: &moved)
         }
@@ -1654,6 +2126,7 @@ final class CircuitEditor {
         var arrowIDs = Set<UUID>()
         var segmentsByWire: [UUID: Set<Int>] = [:]
         var groundTargets: [UUID: GridPoint] = [:]
+        var gateTargets: [UUID: LogicGate] = [:]
         var movedTerminals = Set<GridPoint>()
         for item in items {
             switch item {
@@ -1700,11 +2173,17 @@ final class CircuitEditor {
                     circuit.groupAreas[index].from = circuit.groupAreas[index].from + offset
                     circuit.groupAreas[index].to = circuit.groupAreas[index].to + offset
                 }
+            case .gate(let id):
+                if var gate = circuit.gates.first(where: { $0.id == id }) {
+                    movedTerminals.formUnion(gate.terminals)
+                    gate.position = gate.position + offset
+                    gateTargets[id] = gate
+                }
             case .senseLabel, .group: break
             }
         }
         translateCurrents(in: &circuit, by: offset) { arrowIDs.contains($0.id) || wireIDs.contains($0.wireID) }
-        circuit.moveComponents(componentTargets, grounds: groundTargets, excludingWires: wireIDs.union(segmentsByWire.keys))
+        circuit.moveComponents(componentTargets, grounds: groundTargets, gates: gateTargets, excludingWires: wireIDs.union(segmentsByWire.keys))
         for index in circuit.wires.indices where wireIDs.contains(circuit.wires[index].id) {
             circuit.wires[index].points = circuit.wires[index].points.map { $0 + offset }
         }
@@ -1882,7 +2361,10 @@ final class CircuitEditor {
 
     func clearAll() {
         checkpoint()
-        circuit = Circuit()
+        // The sheet stays analog or digital.
+        var cleared = Circuit()
+        cleared.mode = circuit.mode
+        circuit = cleared
         routing = []
         selection = nil
         pendingEquivalentPoint = nil
@@ -1945,6 +2427,13 @@ final class CircuitEditor {
             point.distance(toSegment: world($0.start), world($0.end)) <= max(tolerance, spacing * 0.7)
         }) {
             return .component(component.id)
+        }
+        if let gate = circuit.gates.last(where: { gate in
+            let bounds = gate.bounds
+            return CGRect(x: bounds.minX * spacing, y: bounds.minY * spacing, width: bounds.width * spacing, height: bounds.height * spacing)
+                .insetBy(dx: -tolerance / 2, dy: -tolerance / 2).contains(point)
+        }) {
+            return .gate(gate.id)
         }
         if let equivalent = circuit.equivalents.last(where: {
             point.distance(toSegment: world($0.start), world($0.end)) <= max(tolerance, spacing * 0.7)

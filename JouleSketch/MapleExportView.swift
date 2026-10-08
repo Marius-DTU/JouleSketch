@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// The calculation step by step, by the method picked at the top
-/// (node voltages, mesh currents or superposition), with buttons to copy the
+/// (node voltages, mesh currents, superposition or, when one is drawn, the
+/// equivalent resistance), with buttons to copy the
 /// same method as Maple code.
 struct MapleExportView: View {
     /// The whole document; `circuit` is what's worked with.
@@ -41,9 +42,12 @@ struct MapleExportView: View {
         return document.inside(group)
     }
 
+    /// The methods offered: the equivalent resistance only when one is drawn.
+    private var methods: [WalkMethod] { WalkMethod.available(for: circuit) }
+
     /// Every method's walkthrough, worked out once for the circuit.
     private var results: [WalkMethod: WalkResult] {
-        Dictionary(uniqueKeysWithValues: WalkMethod.allCases.map { ($0, Walkthrough.make($0, for: circuit)) })
+        Dictionary(uniqueKeysWithValues: methods.map { ($0, Walkthrough.make($0, for: circuit)) })
     }
 
     /// The Maple code for a method, or `nil` if there is none. The
@@ -62,7 +66,9 @@ struct MapleExportView: View {
 
     var body: some View {
         let results = results
-        let shown = method ?? WalkMethod.allCases.first { if case .steps = results[$0] { true } else { false } } ?? .nodal
+        let methods = methods
+        let shown = method.flatMap { methods.contains($0) ? $0 : nil }
+            ?? methods.first { if case .steps = results[$0] { true } else { false } } ?? .nodal
         let code = maple(shown, results[shown])
         if isDocked {
             VStack(spacing: 0) {
@@ -163,7 +169,7 @@ struct MapleExportView: View {
     private func content(shown: WalkMethod, results: [WalkMethod: WalkResult], code: String?) -> some View {
         VStack(spacing: 0) {
             Picker("Metode", selection: Binding(get: { shown }, set: { method = $0; copied = nil })) {
-                ForEach(WalkMethod.allCases) { option in
+                ForEach(methods) { option in
                     // The panel is too narrow for the note; the walkthrough
                     // itself says when a method can't be used.
                     Text(isAvailable(option, results) || isDocked ? option.title : "\(option.title) (ikke mulig)").tag(option)

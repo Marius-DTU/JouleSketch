@@ -35,6 +35,7 @@ interface JouleApp {
   resetKeyBindings(): string;
   setPen(color: number, size: number): void;
   scene(): string;
+  nextChange(): number;
   state(): string;
   takeEditRequest(): string;
   endEdit(): void;
@@ -51,12 +52,30 @@ interface JouleApp {
   mapleMathML(code: string): string;
   toolIcon(id: string, active: boolean): string;
   toolGroups(): string;
+  chooseMode(mode: string): void;
+  logicCircuit(output: number, form: string): string;
+  calculator(): string;
+  setCalculator(field: string, value: string): void;
+  calculatorFromCircuit(output: number, form: string): void;
+  drawCalculatorCircuit(): boolean;
+  setLibrary(storage: string): void;
+  libraryStorage(): string;
+  libraryList(): string;
+  addToLibrary(key: string): string;
+  selectedBlock(): string;
+  removeFromLibrary(id: string): void;
+  placeFromLibrary(id: string): void;
+  exportLibrary(id: string): string;
+  importLibrary(text: string): string;
+  leaveBlockTo(index: number): void;
 }
 
 interface TextLine { id: string; text: string; isMath: boolean }
 interface TextBoxState { id: string; x: number; y: number; scale: number; selected: boolean; lines: TextLine[] }
 interface State {
   tool: string;
+  /** "analog" or "digital"; null while the start page is shown. */
+  mode: string | null;
   canUndo: boolean;
   canRedo: boolean;
   hasSelection: boolean;
@@ -68,6 +87,8 @@ interface State {
   editing: string | null;
   isComplete: boolean;
   issueCount: number;
+  /** The way into the block being edited ("Ark", then each block); empty on the document's sheet. */
+  blockTrail: string[];
   textBoxes: TextBoxState[];
 }
 
@@ -132,6 +153,18 @@ const TOOLS: { id: string; name: string; action?: string }[] = [
   { id: "text", name: "Tekst og udregning", action: "text" },
   { id: "mesh", name: "Maskestrøm", action: "mesh" },
   { id: "groupArea", name: "Gruppe", action: "groupArea" },
+  { id: "gate-and", name: "AND-gate", action: "andGate" },
+  { id: "gate-or", name: "OR-gate", action: "orGate" },
+  { id: "gate-not", name: "NOT-gate (inverter)", action: "notGate" },
+  { id: "gate-nand", name: "NAND-gate", action: "nandGate" },
+  { id: "gate-nor", name: "NOR-gate", action: "norGate" },
+  { id: "gate-xor", name: "XOR-gate", action: "xorGate" },
+  { id: "gate-xnor", name: "XNOR-gate", action: "xnorGate" },
+  { id: "gate-input", name: "Indgang", action: "logicInput" },
+  { id: "gate-output", name: "Udgang", action: "logicOutput" },
+  { id: "gate-block", name: "Blok (modul)", action: "logicBlock" },
+  { id: "gate-high", name: "5V (altid 1)", action: "logicHigh" },
+  { id: "gate-low", name: "GND (altid 0)", action: "logicLow" },
   { id: "pen", name: "Pen" },
   { id: "eraser", name: "Viskelæder" },
 ];
@@ -155,8 +188,10 @@ document.body.innerHTML = `
       <button data-cmd="zoomIn" title="Zoom ind">+</button>
     </div>
     <div class="group">
-      <button data-cmd="report" id="reportButton">Beregning</button>
-      <button data-cmd="walkthrough">Gennemgang og Maple</button>
+      <button data-cmd="report" id="reportButton" class="analogOnly">Beregning</button>
+      <button data-cmd="walkthrough" class="analogOnly">Gennemgang og Maple</button>
+      <button data-cmd="logic" id="logicButton" class="digitalOnly" title="Sandhedstabel og Karnaugh-kort for kredsløbet, og lommeregneren">Sandhedstabel</button>
+      <button data-cmd="library" class="digitalOnly" title="Dine gemte blokke: placér, gem, eksportér og importér">Bibliotek</button>
     </div>
     <div class="spacer"></div>
     <span id="fileName">Uden navn</span>
@@ -169,8 +204,28 @@ document.body.innerHTML = `
       <canvas id="canvas"></canvas>
       <div id="textLayer"></div>
       <div id="toolOptions"></div>
+      <div id="blockTrail" hidden></div>
     </div>
     <aside id="walkPanel" hidden></aside>
+    <aside id="logicPanel" hidden></aside>
+    <div id="startPage" hidden>
+      <h1>Hvad vil du tegne?</h1>
+      <p class="muted">Vælg, hvad arket skal bruges til. Valget gemmes i filen.</p>
+      <div class="cards">
+        <button data-mode="analog">
+          <canvas data-preview="analog"></canvas>
+          <strong>Analog</strong>
+          <span>Modstande, kilder, dioder, kondensatorer og spoler. Programmet beregner spændinger, strømme og effekter og viser udregningen og Maple-koden.</span>
+          <em>Opret analogt ark</em>
+        </button>
+        <button data-mode="digital">
+          <canvas data-preview="digital"></canvas>
+          <strong>Digital</strong>
+          <span>Logiske gates – AND, OR, NOT, NAND, NOR, XOR og XNOR. Sandhedstabeller og Karnaugh-kort for det, du tegner, og en lommeregner, der finder de gates, en sandhedstabel kræver.</span>
+          <em>Opret digitalt ark</em>
+        </button>
+      </div>
+    </div>
   </main>
   <div id="popover" hidden></div>
   <dialog id="dialog"><div id="dialogBody"></div></dialog>
@@ -187,12 +242,15 @@ const dialogBody = document.getElementById("dialogBody")!;
 const palette = document.getElementById("palette")!;
 const toolOptions = document.getElementById("toolOptions")!;
 const walkPanel = document.getElementById("walkPanel")!;
+const logicPanel = document.getElementById("logicPanel")!;
+const startPage = document.getElementById("startPage")!;
 
 // MARK: - Starting the Swift part
 
 const { exports } = await init();
 const app: JouleApp = new exports.JouleApp();
 app.setSettings(JSON.stringify(settings));
+app.setLibrary(localStorage.getItem("blockLibrary") ?? "");
 document.getElementById("loading")?.remove();
 
 let state: State = JSON.parse(app.state());
@@ -226,12 +284,36 @@ function redraw() {
       canvas.style.height = `${height}px`;
       app.setViewSize(width, height);
     }
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    paint(ctx, app.scene(), SHEET_COLOR, width, height);
+    paintSheet();
     state = JSON.parse(app.state());
     updateChrome();
     updateTextBoxes();
+    keepBlinking();
   });
+}
+
+/** Paints the sheet's canvas. */
+function paintSheet() {
+  const ratio = window.devicePixelRatio || 1;
+  const { width, height } = sheet.getBoundingClientRect();
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  paint(ctx, app.scene(), SHEET_COLOR, width, height);
+}
+
+let blinkTimer = 0;
+
+/** Repaints the sheet when a signal generator next changes something on it. */
+function keepBlinking() {
+  clearTimeout(blinkTimer);
+  const delay = app.nextChange();
+  if (delay < 0) return;
+  // A moment after the change, so the new piece of the period is drawn.
+  blinkTimer = window.setTimeout(() => {
+    // A full redraw paints the sheet itself and starts this again.
+    if (frameRequested) return;
+    paintSheet();
+    keepBlinking();
+  }, delay + 1);
 }
 
 /** Call after anything that may have changed the document. */
@@ -244,6 +326,7 @@ function changed() {
 let autosaveTimer = 0;
 function scheduleAutosave() {
   scheduleWalkRefresh();
+  scheduleLogicRefresh();
   clearTimeout(autosaveTimer);
   autosaveTimer = window.setTimeout(() => {
     localStorage.setItem("autosave", app.save());
@@ -397,7 +480,21 @@ function drawToolIcons() {
 
 buildPalette();
 
+/** The kind of sheet the palette was built for. */
+let paletteMode: string | null = null;
+
 function updateChrome() {
+  // A new document shows the start page; the palette follows the kind of sheet.
+  startPage.hidden = state.mode !== null;
+  document.body.dataset.mode = state.mode ?? "start";
+  // Inside a block the palette has no inputs and outputs.
+  const paletteKey = `${state.mode}${state.blockTrail?.length ? "-block" : ""}`;
+  if (paletteKey !== paletteMode) {
+    paletteMode = paletteKey;
+    buildPalette();
+    if (state.mode !== "digital") closeLogicPanel();
+    if (state.mode !== "analog") closeWalkPanel();
+  }
   updatePalette();
   drawToolIcons();
   (document.querySelector('[data-cmd="undo"]') as HTMLButtonElement).disabled = !state.canUndo;
@@ -407,6 +504,7 @@ function updateChrome() {
   const report = document.getElementById("reportButton")!;
   report.textContent = state.issueCount > 0 ? `Beregning (${state.issueCount})` : "Beregning";
   report.classList.toggle("warning", state.issueCount > 0);
+  updateBlockTrail();
   document.getElementById("fileName")!.textContent = fileName + (isDirty ? " •" : "");
   document.title = `${fileName} – JouleSketch`;
 
@@ -468,12 +566,17 @@ function runCommand(name: string) {
     case "zoomOut": app.zoomAroundCenter(0.8); break;
     case "zoomReset": app.resetView(); break;
     case "report": showReport(); return;
+    case "logic":
+      if (logicPanel.hidden) showLogicPanel();
+      else closeLogicPanel();
+      return;
     case "walkthrough":
       if (walkPanel.hidden) showWalkthrough();
       else closeWalkPanel();
       return;
     case "guide": showGuide(); return;
     case "settings": showSettings(); return;
+    case "library": showLibrary(); return;
     default:
       app.command(name);
       changed();
@@ -676,7 +779,7 @@ window.addEventListener("keyup", () => redraw());
 // MARK: - Symbol editor (double-click)
 
 interface Inspection {
-  type: "component" | "probe" | "current" | "mesh" | "group";
+  type: "component" | "probe" | "current" | "mesh" | "group" | "gate";
   item: string;
   title: string;
   name: string;
@@ -702,7 +805,28 @@ interface Inspection {
   hasDutyCycle?: boolean;
   isLowSideOutput?: boolean;
   dutyCycle?: string;
+  /** An LED's color, and the colors to pick from (LEDColor, with their knee voltages). */
+  ledColor?: string;
+  ledColors?: { id: string; name: string }[];
+  /** What a voltage point or current shows (MeasureMode), and the modes to pick from. */
+  measure?: string;
+  measures?: { id: string; name: string }[];
   clockwise?: boolean;
+  /** A logic gate, input or output. */
+  kind?: string;
+  isGate?: boolean;
+  allowsMoreInputs?: boolean;
+  inputCount?: number;
+  minInputs?: number;
+  maxInputs?: number;
+  high?: boolean;
+  /** A block's input and output names, one per line. */
+  blockInputs?: string;
+  blockOutputs?: string;
+  logicValue?: string;
+  kinds?: { id: string; name: string }[];
+  /** Inside a block its inputs and outputs are named after its terminals. */
+  nameLocked?: boolean;
 }
 
 const escapeHTML = (text: string) => text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
@@ -719,6 +843,15 @@ function openPopover(request: { item: string; x: number; y: number; width: numbe
     const placeholder = info.computed ? `${info.computed} (beregnet)` : "ukendt";
     fields.push(field(info.valueTitle, "value", info.value ?? "", placeholder));
     fields.push(`<div class="error" data-error="value"></div>`);
+  }
+  if (info.ledColor !== undefined) {
+    const colors = info.ledColors ?? [];
+    fields.push(`<label>Farve<select data-field="ledColor">${colors.map((c) => `<option value="${c.id}" ${c.id === info.ledColor ? "selected" : ""}>${escapeHTML(c.name)}</option>`).join("")}</select></label>`);
+  }
+  if (info.measure !== undefined) {
+    const measures = info.measures ?? [];
+    fields.push(`<label>Vis<select data-field="measure">${measures.map((m) => `<option value="${m.id}" ${m.id === info.measure ? "selected" : ""}>${escapeHTML(m.name)}</option>`).join("")}</select></label>`);
+    fields.push(`<p class="hint">Med en signalgenerator: øjebliksværdien svinger med signalet, middel og RMS er som et multimeter på DC og AC.</p>`);
   }
   if (info.isDependent) fields.push(field("Styres af", "controlName", info.controlName ?? "", info.controlPlaceholder));
   if (info.closed !== undefined) {
@@ -749,6 +882,41 @@ function openPopover(request: { item: string; x: number; y: number; width: numbe
     fields.push(`<button data-action="flip">Vend retning</button>`);
   }
   if (info.type === "current" || info.type === "mesh") fields.push(`<button data-action="flip">Vend retning</button>`);
+  if (info.type === "gate") {
+    if (info.isGate) {
+      // A gate has no name; its type and inputs instead.
+      fields.splice(1, 1);
+      const kinds = info.kinds ?? [];
+      fields.push(`<label>Type<select data-field="kind">${kinds.map((k) => `<option value="${k.id}" ${k.id === info.kind ? "selected" : ""}>${escapeHTML(k.name)}</option>`).join("")}</select></label>`);
+      if (info.allowsMoreInputs) {
+        fields.push(`<label>Indgange<input type="number" data-field="inputCount" min="${info.minInputs}" max="${info.maxInputs}" value="${info.inputCount}"></label>`);
+      }
+    } else if (info.kind === "high" || info.kind === "low") {
+      // A flag has no name; just its fixed value.
+      fields.splice(1, 1);
+      fields.push(`<p class="hint">${info.kind === "high" ? "Det, der forbindes til 5V, er altid 1. Alle 5V-flag er det samme signal." : "Det, der forbindes til GND, er altid 0. Alle GND-flag er det samme signal."}</p>`);
+    } else if (info.kind === "block") {
+      fields.push(`<label>Indgange<textarea data-field="blockInputs" rows="5">${escapeHTML(info.blockInputs ?? "")}</textarea></label>`);
+      fields.push(`<label>Udgange<textarea data-field="blockOutputs" rows="5">${escapeHTML(info.blockOutputs ?? "")}</textarea></label>`);
+      fields.push(`<p class="hint">Ét navn pr. linje, oppefra. En tom linje giver et mellemrum uden ben. Ledningerne følger med, når benene flyttes.</p>`);
+      fields.push(`<button data-action="openBlock" title="Byg, hvad blokken gør (eller dobbeltklik på den)">Åbn blokken</button>`);
+      fields.push(`<button data-action="saveToLibrary">Gem i biblioteket</button>`);
+      fields.push(`<div class="hint" data-library-message></div>`);
+    } else if (info.nameLocked) {
+      fields.splice(1, 1, `<label>Navn<input value="${escapeHTML(info.name)}" disabled></label>`, `<p class="hint">Navnet er et af blokkens ben. Ret benene i blokkens egenskaber (højreklik på blokken).</p>`);
+      if (info.kind === "input") {
+        fields.push(`<label class="check"><input type="checkbox" data-field="high" ${info.high ? "checked" : ""}> Værdi 1</label>`);
+      } else {
+        fields.push(`<p class="hint">Værdi: ${escapeHTML(info.logicValue ?? "ukendt")}</p>`);
+      }
+    } else if (info.kind === "input") {
+      fields.push(`<label class="check"><input type="checkbox" data-field="high" ${info.high ? "checked" : ""}> Værdi 1</label>`);
+      fields.push(`<p class="hint">Klik på indgangen med Vælg-værktøjet for at skifte mellem 0 og 1. Indgange med samme navn er det samme signal.</p>`);
+    } else {
+      fields.push(`<p class="hint">Værdi: ${escapeHTML(info.logicValue ?? "ukendt")}</p>`);
+    }
+    fields.push(`<button data-action="flip">Rotér</button>`);
+  }
   if (info.note !== undefined) fields.push(`<label>Note<textarea data-field="note" rows="3">${escapeHTML(info.note)}</textarea></label>`);
   fields.push(`<div class="buttons"><button data-action="close" class="primary">Færdig</button></div>`);
 
@@ -776,9 +944,10 @@ function closePopover() {
 
 popover.addEventListener("input", (event) => {
   const input = event.target as HTMLInputElement;
-  // Another waveform shows other fields, so the editor is drawn again.
-  if (input.dataset.field === "waveform" && popover.dataset.item) {
-    app.setField(popover.dataset.item, "waveform", input.value);
+  // Another waveform shows other fields, and an LED color sets the value,
+  // so the editor is drawn again.
+  if ((input.dataset.field === "waveform" || input.dataset.field === "ledColor" || input.dataset.field === "kind") && popover.dataset.item) {
+    app.setField(popover.dataset.item, input.dataset.field, input.value);
     changed();
     const rect = popover.getBoundingClientRect();
     const sheetRect = sheet.getBoundingClientRect();
@@ -800,6 +969,18 @@ popover.addEventListener("click", (event) => {
   if (action === "flip" && popover.dataset.item) {
     app.setField(popover.dataset.item, "flip", "");
     changed();
+  }
+  if (action === "openBlock" && popover.dataset.item) {
+    const item = popover.dataset.item;
+    closePopover();
+    app.setField(item, "openBlock", "");
+    changed();
+  }
+  if (action === "saveToLibrary" && popover.dataset.item) {
+    const message = app.addToLibrary(popover.dataset.item);
+    saveLibrary();
+    const field = popover.querySelector<HTMLElement>("[data-library-message]");
+    if (field) field.textContent = message;
   }
 });
 
@@ -913,6 +1094,105 @@ function focusLine(boxID: string, index: number) {
   });
 }
 
+// MARK: - Blocks and the block library
+
+const blockTrail = document.getElementById("blockTrail")!;
+
+/** Over the sheet while a block's sub-diagram is edited: the way back out, like the Mac app's. */
+function updateBlockTrail() {
+  const trail = state.blockTrail ?? [];
+  blockTrail.hidden = trail.length === 0;
+  const html = trail.length === 0 ? "" : `<button data-trail="back" title="Gå ud af blokken (Esc)">‹</button>` + trail.map((name, index) =>
+    index === trail.length - 1 ? `<strong>${escapeHTML(name)}</strong>` : `<button class="link" data-trail="${index}">${escapeHTML(name)}</button>`
+  ).join(`<span class="muted">›</span>`);
+  if (blockTrail.innerHTML !== html) blockTrail.innerHTML = html;
+}
+
+blockTrail.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-trail]");
+  if (!target) return;
+  if (target.dataset.trail === "back") app.command("leaveBlock");
+  else app.leaveBlockTo(Number(target.dataset.trail));
+  changed();
+});
+
+/** Keeps the library in the browser's storage, like the Mac app's settings. */
+function saveLibrary() {
+  localStorage.setItem("blockLibrary", app.libraryStorage());
+}
+
+function download(text: string, name: string) {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+const libraryFileName = "JouleSketch-bibliotek.json";
+
+/** The block library: save the selected block, place, export, import and delete blocks. */
+function showLibrary(message = "") {
+  const entries = JSON.parse(app.libraryList()) as { id: string; name: string; summary: string }[];
+  const rows = entries.length
+    ? `<ul class="library">${entries.map((e) => `<li><div><strong>${escapeHTML(e.name)}</strong><br><span class="muted">${escapeHTML(e.summary)}</span></div>
+        <span><button data-lib="place" data-id="${e.id}" title="Klik på arket for at placere blokken">Placér</button>
+        <button data-lib="export" data-id="${e.id}">Eksportér</button>
+        <button data-lib="remove" data-id="${e.id}">Slet</button></span></li>`).join("")}</ul>`
+    : `<p class="muted">Biblioteket er tomt. Markér en blok på arket, og tryk på Gem markeret blok – eller importér et bibliotek.</p>`;
+  showDialog(`<h2>Bibliotek</h2>${rows}
+    <div class="buttons">
+      <button data-lib="save" ${app.selectedBlock() ? "" : "disabled"}>Gem markeret blok</button>
+      <button data-lib="import">Importér…</button>
+      <button data-lib="exportAll" ${entries.length ? "" : "disabled"}>Eksportér…</button>
+    </div>
+    ${message ? `<p class="hint">${escapeHTML(message)}</p>` : ""}`);
+}
+
+dialogBody.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement).closest<HTMLElement>("[data-lib]");
+  if (!target) return;
+  const id = target.dataset.id ?? "";
+  switch (target.dataset.lib) {
+    case "place":
+      app.placeFromLibrary(id);
+      dialog.close();
+      changed();
+      return;
+    case "export":
+      download(app.exportLibrary(id), libraryFileName);
+      return;
+    case "exportAll":
+      download(app.exportLibrary(""), libraryFileName);
+      return;
+    case "remove":
+      app.removeFromLibrary(id);
+      saveLibrary();
+      showLibrary();
+      return;
+    case "save": {
+      const message = app.addToLibrary(app.selectedBlock());
+      saveLibrary();
+      showLibrary(message);
+      return;
+    }
+    case "import": {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".json,application/json";
+      input.addEventListener("change", async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        const message = app.importLibrary(await file.text());
+        saveLibrary();
+        showLibrary(message);
+      });
+      input.click();
+      return;
+    }
+  }
+});
+
 // MARK: - Dialogs
 
 function showDialog(html: string) {
@@ -982,6 +1262,9 @@ function showReport() {
 }
 
 interface Walk {
+  /** The method shown, and the ones offered (the equivalent resistance only when one is drawn). */
+  method: string;
+  methods: { id: string; title: string }[];
   unavailable?: string;
   maple: string | null;
   sections?: { title: string; lines: { math: boolean; text: string }[] }[];
@@ -992,11 +1275,11 @@ let walkGroup = "";
 
 function showWalkthrough() {
   const groups = JSON.parse(app.groups()) as { id: string; name: string }[];
-  const methods = [["nodal", "Knudepunkt"], ["mesh", "Maske"], ["superposition", "Superposition"]];
   const walk = JSON.parse(app.walkthrough(walkMethod, walkGroup)) as Walk;
+  const shown = walk.method;
   const header = `
     <h2>Gennemgang og Maple</h2>
-    <div class="segmented">${methods.map(([id, name]) => `<button data-method="${id}" class="${id === walkMethod ? "active" : ""}">${name}</button>`).join("")}</div>
+    <div class="segmented">${walk.methods.map(({ id, title }) => `<button data-method="${id}" class="${id === shown ? "active" : ""}">${title}</button>`).join("")}</div>
     ${groups.length ? `<select id="walkGroup"><option value="">Hele dokumentet</option>${groups.map((g) => `<option value="${g.id}" ${g.id === walkGroup ? "selected" : ""}>${escapeHTML(g.name)}</option>`).join("")}</select>` : ""}`;
   const body = walk.unavailable
     ? `<p class="unavailable">${escapeHTML(walk.unavailable)}</p>`
@@ -1079,7 +1362,7 @@ function scheduleWalkRefresh() {
 }
 
 function showSettings() {
-  const bindings = JSON.parse(app.keyBindingList()) as { action: string; name: string; key: string; command: boolean; shift: boolean; conflict: boolean }[];
+  const bindings = JSON.parse(app.keyBindingList()) as { action: string; name: string; key: string; command: boolean; shift: boolean; conflict: boolean; mode: string | null }[];
   showDialog(`
     <h2>Indstillinger</h2>
     <h3>Symboler</h3>
@@ -1093,10 +1376,13 @@ function showSettings() {
     <label>Bredde <input type="number" id="setWidth" min="10" max="1000" step="10" value="${settings.pageWidth}"></label>
     <label>Højde <input type="number" id="setHeight" min="10" max="1000" step="10" value="${settings.pageHeight}"></label>
     <h3>Tastaturgenveje</h3>
-    <table class="keys">${bindings.map((b) => `
+    ${[[null, "Alle ark"], ["analog", "Analoge ark"], ["digital", "Digitale ark"]].map(([mode, title]) => `
+    <h4>${title}</h4>
+    <table class="keys">${bindings.filter((b) => b.mode === mode).map((b) => `
       <tr class="${b.conflict ? "conflict" : ""}"><td>${escapeHTML(b.name)}</td>
       <td>${b.command ? "Ctrl+" : ""}${b.shift ? "Shift+" : ""}<input class="key" data-action="${b.action}" value="${escapeHTML(b.key)}" maxlength="1"></td></tr>`).join("")}
-    </table>
+    </table>`).join("")}
+    <p class="hint">Analoge og digitale værktøjer må gerne dele en tast.</p>
     <button id="resetKeys">Nulstil genveje</button>
   `);
   const update = () => {
@@ -1122,5 +1408,231 @@ function showSettings() {
     showSettings();
   });
 }
+
+// MARK: - Start page
+
+startPage.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-mode]");
+  if (!button) return;
+  app.chooseMode(button.dataset.mode!);
+  changed();
+  canvas.focus();
+});
+
+/** The small drawings on the start page's cards, from the shared Swift code. */
+for (const preview of startPage.querySelectorAll<HTMLCanvasElement>("canvas[data-preview]")) {
+  const ratio = window.devicePixelRatio || 1;
+  preview.width = 60 * ratio;
+  preview.height = 48 * ratio;
+  const context = preview.getContext("2d")!;
+  context.setTransform(ratio * 2, 0, 0, ratio * 2, 0, 0);
+  paint(context, app.toolIcon(preview.dataset.preview === "digital" ? "gate-and" : "resistor", false), "transparent", 30, 24);
+}
+
+// MARK: - Truth tables and Karnaugh maps
+
+interface LogicAnalysis {
+  output: string;
+  form: string;
+  expression: string;
+  isConstant: boolean;
+  groupCount: number;
+  maxGroups: number;
+  gates: string[];
+  mapNote?: string;
+  map?: {
+    rowVariables: string;
+    columnVariables: string;
+    rowLabels: string[];
+    columnLabels: string[];
+    cells: { m: number; v: string }[][];
+    groups: { color: string; inset: number; blocks: { row: number; column: number; rows: number; columns: number }[] }[];
+  };
+  steps: { text: string; expression: string | null; color: string | null }[];
+}
+
+interface LogicCircuit {
+  variables: string[];
+  issues: string[];
+  message?: string;
+  output?: number;
+  outputs?: { name: string; values: string[] }[];
+  drawn?: string | null;
+  canUseInCalculator?: boolean;
+  analysis?: LogicAnalysis;
+}
+
+interface Calculator {
+  variables: string[];
+  outputName: string;
+  form: string;
+  minVariables: number;
+  maxVariables: number;
+  values: string[];
+  analysis: LogicAnalysis;
+}
+
+let logicTab: "circuit" | "calculator" = "circuit";
+let logicOutput = 0;
+let circuitForm = "sumOfProducts";
+let drawFailed = false;
+
+const bold = (text: string) => escapeHTML(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+/** A truth table: the row number, the inputs and the output columns. */
+function truthTableHTML(variables: string[], outputs: { name: string; values: string[] }[], editable: boolean, highlighted = -1): string {
+  const rows = 1 << variables.length;
+  const head = `<tr><th class="muted">m</th>${variables.map((v) => `<th>${escapeHTML(v)}</th>`).join("")}${outputs.map((o, i) => `<th class="${i === highlighted ? "highlight" : ""}">${escapeHTML(o.name)}</th>`).join("")}</tr>`;
+  let body = "";
+  for (let row = 0; row < rows; row++) {
+    const bits = variables.map((_, i) => `<td>${(row >> (variables.length - 1 - i)) & 1}</td>`).join("");
+    const values = outputs.map((o, i) => {
+      const value = o.values[row] ?? "?";
+      const cls = `value v${value === "X" ? "x" : value === "?" ? "q" : value} ${i === highlighted ? "highlight" : ""}`;
+      return editable && i === 0
+        ? `<td><button class="${cls}" data-row="${row}" title="Klik for at skifte mellem 0, 1 og X">${value}</button></td>`
+        : `<td class="${cls}">${value}</td>`;
+    }).join("");
+    body += `<tr><td class="muted">${row}</td>${bits}${values}</tr>`;
+  }
+  return `<div class="tableScroll"><table class="truthTable">${head}${body}</table></div>`;
+}
+
+/** A Karnaugh map with the groups drawn around their cells. */
+function karnaughHTML(map: NonNullable<LogicAnalysis["map"]>): string {
+  const cell = 40;
+  const header = { width: 54, height: 40 };
+  const columns = map.columnLabels.length;
+  const rows = map.rowLabels.length;
+  let html = `<div class="kmap" style="width:${header.width + columns * cell + 2}px;height:${header.height + rows * cell + 2}px">`;
+  html += `<div class="corner" style="width:${header.width}px;height:${header.height}px"><span class="rowVars">${escapeHTML(map.rowVariables)}</span><span class="colVars">${escapeHTML(map.columnVariables)}</span></div>`;
+  map.columnLabels.forEach((label, i) => {
+    html += `<div class="label" style="left:${header.width + i * cell}px;top:${header.height - 22}px;width:${cell}px">${label}</div>`;
+  });
+  map.rowLabels.forEach((label, i) => {
+    html += `<div class="label" style="left:0;top:${header.height + i * cell + cell / 2 - 9}px;width:${header.width - 6}px;text-align:right">${label}</div>`;
+  });
+  map.cells.forEach((cells, r) => cells.forEach((c, k) => {
+    html += `<div class="cell v${c.v === "X" ? "x" : c.v}" style="left:${header.width + k * cell}px;top:${header.height + r * cell}px;width:${cell}px;height:${cell}px">${c.v}<small>${c.m}</small></div>`;
+  }));
+  for (const group of map.groups) {
+    for (const block of group.blocks) {
+      const x = header.width + block.column * cell + group.inset;
+      const y = header.height + block.row * cell + group.inset;
+      html += `<div class="group" style="left:${x}px;top:${y}px;width:${block.columns * cell - 2 * group.inset}px;height:${block.rows * cell - 2 * group.inset}px;border-color:${group.color};background:${group.color.replace("rgb", "rgba").replace(")", ", 0.12)")}"></div>`;
+    }
+  }
+  return html + "</div>";
+}
+
+/** The smallest expression, the gates it needs, the map and the steps. */
+function analysisHTML(analysis: LogicAnalysis): string {
+  const forms = [["sumOfProducts", "SOP (ettaller)"], ["productOfSums", "POS (nuller)"]];
+  return `
+    <div class="segmented">${forms.map(([id, name]) => `<button data-form="${id}" class="${id === analysis.form ? "active" : ""}">${name}</button>`).join("")}</div>
+    <h4>Mindste udtryk</h4><div class="expr">${analysis.expression}</div>
+    <h4>Du skal bruge</h4>
+    ${analysis.gates.length ? `<ul>${analysis.gates.map((g) => `<li>${escapeHTML(g)}</li>`).join("")}</ul>` : `<p class="muted">Ingen gates – udgangen er konstant.</p>`}
+    ${analysis.map ? `<h4>Karnaugh-kort</h4>${karnaughHTML(analysis.map)}` : analysis.mapNote ? `<p class="hint">${escapeHTML(analysis.mapNote)}</p>` : ""}
+    <h4>Sådan findes udtrykket</h4>
+    ${analysis.steps.map((step) => `<div class="step">${step.color ? `<span class="dot" style="background:${step.color}"></span>` : ""}<div><p>${bold(step.text)}</p>${step.expression ? `<div class="expr small">${step.expression}</div>` : ""}</div></div>`).join("")}`;
+}
+
+function showLogicPanel() {
+  const tabs = `<div class="logicTabs"><div class="segmented">
+      <button data-tab="circuit" class="${logicTab === "circuit" ? "active" : ""}">Kredsløbet</button>
+      <button data-tab="calculator" class="${logicTab === "calculator" ? "active" : ""}">Lommeregner</button>
+    </div><button data-logic-close title="Luk sandhedstabellen">✕</button></div>`;
+  let body = "";
+  if (logicTab === "circuit") {
+    const info = JSON.parse(app.logicCircuit(logicOutput, circuitForm)) as LogicCircuit;
+    body = `<h2>Sandhedstabel for kredsløbet</h2>`;
+    if (info.message) {
+      body += `<p class="muted">${escapeHTML(info.message)}</p>`;
+    } else {
+      body += info.issues.map((issue) => `<div class="issue warning"><p>${escapeHTML(issue)}</p></div>`).join("");
+      const outputs = info.outputs ?? [];
+      if (outputs.length > 1) {
+        body += `<label>Udgang <select id="logicOutput">${outputs.map((o, i) => `<option value="${i}" ${i === info.output ? "selected" : ""}>${escapeHTML(o.name)}</option>`).join("")}</select></label>`;
+      }
+      body += truthTableHTML(info.variables, outputs, false, outputs.length > 1 ? info.output ?? 0 : -1);
+      if (info.drawn) body += `<h4>Udtrykket fra tegningen</h4><div class="expr">${info.drawn}</div>`;
+      if (info.analysis) {
+        body += analysisHTML(info.analysis);
+        if (info.canUseInCalculator) body += `<div class="buttons left"><button data-use-calculator>Brug i lommeregneren</button></div>`;
+      }
+    }
+  } else {
+    const calc = JSON.parse(app.calculator()) as Calculator;
+    const analysis = calc.analysis;
+    body = `<h2>Lommeregner</h2>
+      <p class="muted">Skriv den sandhedstabel, kredsløbet skal opfylde. Klik på udgangens felter for at skifte mellem 0, 1 og X (don't care).</p>
+      <div class="row">
+        <label>Indgange <input type="number" id="calcCount" min="${calc.minVariables}" max="${calc.maxVariables}" value="${calc.variables.length}"></label>
+        <label>Udgang <input id="calcName" value="${escapeHTML(calc.outputName)}" size="6"></label>
+      </div>
+      <div class="buttons left"><button data-fill="0">Alle 0</button><button data-fill="1">Alle 1</button><button data-fill="X">Alle X</button></div>
+      ${truthTableHTML(calc.variables, [{ name: analysis.output, values: calc.values }], true)}
+      ${analysisHTML(analysis)}
+      <div class="buttons left"><button class="primary" data-draw ${analysis.isConstant ? "disabled" : ""}>Tegn kredsløbet på arket</button></div>
+      ${analysis.isConstant ? `<p class="hint">Udgangen er konstant, så der er ingen gates at tegne.</p>` : drawFailed ? `<p class="hint warning">Kredsløbet har for mange grupper til at blive tegnet (højst ${analysis.maxGroups}).</p>` : ""}`;
+  }
+  const scroll = logicPanel.scrollTop;
+  logicPanel.innerHTML = tabs + body;
+  logicPanel.scrollTop = scroll;
+  logicPanel.hidden = false;
+}
+
+function closeLogicPanel() {
+  if (logicPanel.hidden) return;
+  logicPanel.hidden = true;
+  logicPanel.innerHTML = "";
+}
+
+let logicRefreshTimer = 0;
+/** The truth table follows the drawing as it is edited. */
+function scheduleLogicRefresh() {
+  if (logicPanel.hidden) return;
+  clearTimeout(logicRefreshTimer);
+  logicRefreshTimer = window.setTimeout(() => {
+    if (!logicPanel.hidden && !logicPanel.contains(document.activeElement)) showLogicPanel();
+  }, 150);
+}
+
+logicPanel.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement).closest<HTMLElement>("button");
+  if (!target) return;
+  if (target.hasAttribute("data-logic-close")) {
+    closeLogicPanel();
+    return;
+  }
+  if (target.dataset.tab) logicTab = target.dataset.tab as typeof logicTab;
+  if (target.dataset.form) {
+    if (logicTab === "circuit") circuitForm = target.dataset.form;
+    else app.setCalculator("form", target.dataset.form);
+  }
+  if (target.dataset.row) app.setCalculator("cycle", target.dataset.row);
+  if (target.dataset.fill) app.setCalculator("fill", target.dataset.fill);
+  if (target.hasAttribute("data-use-calculator")) {
+    app.calculatorFromCircuit(logicOutput, circuitForm);
+    logicTab = "calculator";
+  }
+  if (target.hasAttribute("data-draw")) {
+    drawFailed = !app.drawCalculatorCircuit();
+    changed();
+  } else if (target.dataset.row || target.dataset.fill || target.dataset.form) {
+    drawFailed = false;
+  }
+  showLogicPanel();
+});
+
+logicPanel.addEventListener("change", (event) => {
+  const target = event.target as HTMLInputElement;
+  if (target.id === "logicOutput") logicOutput = Number(target.value);
+  if (target.id === "calcCount") app.setCalculator("count", target.value);
+  if (target.id === "calcName") app.setCalculator("name", target.value);
+  drawFailed = false;
+  showLogicPanel();
+});
 
 redraw();

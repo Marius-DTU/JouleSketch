@@ -11,10 +11,14 @@ import PackageDescription
 ///
 /// Build with `Web/build.sh` (see `Web/README.md`).
 let sharedFiles = [
+    "BlockLibrary.swift",
     "Circuit.swift",
     "CircuitSolver.swift",
     "CircuitEditor.swift",
+    "EquivalentWalkthrough.swift",
     "KeyBindings.swift",
+    "Logic.swift",
+    "LogicAnalysis.swift",
     "MapleExporter.swift",
     "MapleMathML.swift",
     "MathLatex.swift",

@@ -13,6 +13,8 @@ enum SettingsKey {
     static let studyMode = "studyMode"
     /// Shows the walkthrough in a panel beside the sheet instead of a window over it.
     static let walkthroughSideBySide = "walkthroughSideBySide"
+    /// The user's library of blocks (`BlockLibrary.storageString`).
+    static let blockLibrary = "blockLibrary"
 }
 
 // MARK: - Background
@@ -133,8 +135,18 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Tastaturgenveje – alle ark") {
+                ForEach(KeyAction.allCases.filter { $0.mode == nil }) { action in
+                    keyRow(for: action)
+                }
+            }
+            Section("Tastaturgenveje – analoge ark") {
+                ForEach(KeyAction.allCases.filter { $0.mode == .analog }) { action in
+                    keyRow(for: action)
+                }
+            }
             Section {
-                ForEach(KeyAction.allCases) { action in
+                ForEach(KeyAction.allCases.filter { $0.mode == .digital }) { action in
                     keyRow(for: action)
                 }
                 Button("Nulstil til standard") {
@@ -142,9 +154,9 @@ struct SettingsView: View {
                 }
                 .disabled(keyBindings == KeyBindings())
             } header: {
-                Text("Tastaturgenveje")
+                Text("Tastaturgenveje – digitale ark")
             } footer: {
-                Text("Genvejene virker, når tegnefladen er aktiv. Faste taster: Esc afslutter en ledning eller skifter til Vælg, Backspace sletter, ⌘A markerer alt, ⌘C kopierer, ⌘V indsætter ved markøren, ⌘-klik tilføjer eller fjerner fra markeringen, ⌘ + højretræk laver et område, der udelades af beregningen, ⇧-træk med Ledning tegner en firkant, ⌘Z fortryder.")
+                Text("Genvejene virker, når tegnefladen er aktiv. Analoge og digitale værktøjer må gerne dele en tast. Faste taster: Esc afslutter en ledning eller skifter til Vælg, Backspace sletter, ⌘A markerer alt, ⌘C kopierer, ⌘V indsætter ved markøren, ⌘-klik tilføjer eller fjerner fra markeringen, ⌘ + højretræk laver et område, der udelades af beregningen, ⇧-træk med Ledning tegner en firkant, ⌘Z fortryder.")
             }
 
         }

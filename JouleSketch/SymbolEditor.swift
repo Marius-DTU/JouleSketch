@@ -44,8 +44,13 @@ struct SymbolEditorView: View {
                             }
                             .focused($isValueFocused)
                             .onSubmit { dismiss() }
+                            // Picking an LED color fills in a new value.
+                            .id(component.color)
                         }
 
+                        if component.kind == .led {
+                            LEDColorPicker(editor: editor, component: component)
+                        }
                         if component.kind.isDependent {
                             DependentSourceControls(editor: editor, component: component)
                         }
@@ -80,6 +85,7 @@ struct SymbolEditorView: View {
                         }
                         .focused($isValueFocused)
                         .onSubmit { dismiss() }
+                        MeasurePicker(mode: probe.measure) { mode in editor.updateProbe(id: id) { $0.measure = mode } }
                     }
                     Section("Note") {
                         NoteField(text: Binding(
@@ -102,6 +108,7 @@ struct SymbolEditorView: View {
                         }
                         .focused($isValueFocused)
                         .onSubmit { dismiss() }
+                        MeasurePicker(mode: arrow.measure) { mode in editor.updateCurrentArrow(id: id) { $0.measure = mode } }
 
                         Button("Vend retning", systemImage: "arrow.left.arrow.right") {
                             editor.updateCurrentArrow(id: id) { $0.forward.toggle() }
@@ -134,6 +141,12 @@ struct SymbolEditorView: View {
                     Section("\(owner.controlLabel) for \(owner.name)") {
                         ControlNameField(editor: editor, component: owner)
                             .onSubmit { dismiss() }
+                    }
+                }
+            case .gate(let id):
+                if let gate = editor.gate(id: id) {
+                    Section(gate.kind.displayName) {
+                        GateFields(editor: editor, gate: gate) { dismiss() }
                     }
                 }
             default:

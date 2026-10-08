@@ -55,6 +55,7 @@ struct SolverReportView: View {
         case .conflict: "exclamationmark.octagon.fill"
         case .missing: "questionmark.circle.fill"
         case .notice: "info.circle.fill"
+        case .warning: "exclamationmark.triangle.fill"
         }
     }
 
@@ -63,6 +64,7 @@ struct SolverReportView: View {
         case .conflict: .red
         case .missing: .orange
         case .notice: .blue
+        case .warning: .orange
         }
     }
 }
@@ -70,8 +72,8 @@ struct SolverReportView: View {
 extension CircuitSolution {
     /// Symbol for the toolbar button and report summary.
     static func symbol(for solution: CircuitSolution) -> String {
-        if !solution.isConsistent { return "exclamationmark.triangle" }
-        if solution.issues.contains(where: { $0.kind != .notice }) || solution.solvedCount < solution.unknownCount {
+        if !solution.isConsistent || solution.hasWarnings { return "exclamationmark.triangle" }
+        if solution.issues.contains(where: { $0.kind == .conflict || $0.kind == .missing }) || solution.solvedCount < solution.unknownCount {
             return "questionmark.circle"
         }
         return solution.issues.isEmpty ? "checkmark.circle" : "info.circle"

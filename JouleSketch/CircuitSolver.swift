@@ -45,11 +45,126 @@ nonisolated struct CircuitSolution {
     /// fundamental (first Fourier term), solved with phasors.
     var fundamental: PhasorValues?
 
+    /// Parts with a signal generator and diodes, solved instant by instant
+    /// over a period. Their values above are averages over the period; on
+    /// the sheet `at(_:)` shows them as they are right now below
+    /// `SignalTimeline.steadyFrequency`.
+    var timelines: [SignalTimeline] = []
+    /// The frequency of voltage points and currents that follow a signal
+    /// generator with phasors (their values are amplitudes, or averages with
+    /// the fundamental in `fundamental`), by id.
+    var signalFrequency: [UUID: Double] = [:]
+    /// The LEDs getting more than their rated current, with their (highest)
+    /// current. They're marked on the sheet, also in study mode.
+    var ledOvercurrent: [UUID: Double] = [:]
+
     /// The fundamental of a voltage point or current as text, to show after
-    /// its average: "~ 0,4 V ∠ −80°". `nil` without PWM.
+    /// its average: "~ 0,4 V ∠ −80°". `nil` without PWM, and when the
+    /// fundamental there is 0 (nothing of the signal gets through).
     func fundamentalText(_ id: UUID, unit: String) -> String? {
-        guard let fundamental, let value = fundamental.values[id] else { return nil }
+        guard let fundamental, let value = fundamental.values[id], abs(value) > 1e-9 else { return nil }
         return "~ " + SIValue.format(value, unit: unit, phase: fundamental.phases[id])
+    }
+
+    /// How brightly an LED is drawn at `time` (seconds), from 0 (off) to 1.
+    /// In DC it follows its current, fully lit at the rated current. With a
+    /// signal generator it blinks in step with the signal, or from
+    /// `SignalTimeline.steadyFrequency` shines steadily at its average
+    /// brightness over the period.
+    func ledBrightness(_ id: UUID, at time: Double) -> Double {
+        if let timeline = timelines.first(where: { $0.ids.contains(id) }) { return timeline.brightness(id, at: time) }
+        guard diodeConducts[id] == true else { return 0 }
+        return diodeValues[id].map { LEDModel.brightness(current: $0.current) } ?? 1
+    }
+
+    /// A computed voltage or current as shown after "=", the way `mode`
+    /// says, at `time` (seconds). `nil` if it isn't known.
+    func measurementText(_ id: UUID, mode: MeasureMode?, unit: String, at time: Double) -> String? {
+        let mode = mode ?? .auto
+        if mode == .auto {
+            guard let value = probeValues[id] ?? currentValues[id] else { return nil }
+            var text = SIValue.format(value, unit: unit, phase: phases[id])
+            if let fundamental = fundamentalText(id, unit: unit) { text += "  " + fundamental }
+            return text
+        }
+        guard let wave = measuredWave(id) else { return nil }
+        switch mode {
+        case .auto, .instant:
+            // Too fast to follow: the RMS, which is what it looks like.
+            if let frequency = wave.frequency, frequency >= SignalTimeline.steadyFrequency {
+                return SIValue.format(wave.rms, unit: unit) + " " + MeasureMode.rms.suffix
+            }
+            // Rounding noise at a zero crossing is 0.
+            let value = wave.value(at: time)
+            let shown = abs(value) < 1e-9 * abs(wave.peak) ? 0 : value
+            return SIValue.format(shown, unit: unit) + " " + mode.suffix
+        case .average: return SIValue.format(wave.mean, unit: unit) + " " + mode.suffix
+        case .rms: return SIValue.format(wave.rms, unit: unit) + " " + mode.suffix
+        case .peak: return SIValue.format(wave.peak, unit: unit) + " " + mode.suffix
+        }
+    }
+
+    /// How a computed voltage or current goes over a period.
+    private func measuredWave(_ id: UUID) -> MeasuredWave? {
+        if let timeline = timelines.first(where: { $0.ids.contains(id) }) {
+            var pieces: [(start: Double, end: Double, value: Double)] = []
+            for segment in timeline.segments {
+                guard let value = segment.solution.probeValues[id] ?? segment.solution.currentValues[id] else { return nil }
+                pieces.append((segment.start, segment.end, value))
+            }
+            return MeasuredWave(frequency: timeline.frequency, shape: .pieces(pieces))
+        }
+        guard let value = probeValues[id] ?? currentValues[id] else { return nil }
+        if let fundamental, let amplitude = fundamental.values[id] {
+            // A square wave: its average plus its fundamental (higher harmonics left out).
+            return MeasuredWave(
+                frequency: signalFrequency[id] ?? fundamental.frequency,
+                shape: .sinusoid(offset: value, amplitude: amplitude, phase: fundamental.phases[id] ?? 0)
+            )
+        }
+        if let frequency = signalFrequency[id] {
+            return MeasuredWave(frequency: frequency, shape: .sinusoid(offset: 0, amplitude: value, phase: phases[id] ?? 0))
+        }
+        return MeasuredWave(frequency: nil, shape: .constant(value))
+    }
+
+    /// When the sheet next needs redrawing after `time` (seconds): when a
+    /// timeline changes, or soon when a value is shown as it is right now
+    /// (`continuous`).
+    func nextRedraw(after time: Double, continuous: Bool) -> Double? {
+        let change = nextChange(after: time)
+        guard continuous else { return change }
+        return min(change ?? .infinity, time + 1.0 / 30)
+    }
+
+    /// Whether the values or LEDs change visibly over time, so the sheet has
+    /// to be redrawn as they do.
+    var isAnimated: Bool { timelines.contains(where: \.isAnimated) }
+
+    /// When the sheet next changes after `time` (seconds), for redrawing.
+    func nextChange(after time: Double) -> Double? {
+        timelines.compactMap { $0.nextChange(after: time) }.min()
+    }
+
+    /// The solution as it is at `time` (seconds), for drawing: in parts
+    /// that change slowly enough to follow (below
+    /// `SignalTimeline.steadyFrequency`) the values right now instead of
+    /// their averages.
+    func at(_ time: Double) -> CircuitSolution {
+        var result = self
+        for timeline in timelines where timeline.isLive {
+            guard let instant = timeline.segment(at: time)?.solution else { continue }
+            func replace<Value>(_ values: inout [UUID: Value], with new: [UUID: Value]) {
+                for id in timeline.ids { values[id] = new[id] }
+            }
+            replace(&result.componentValues, with: instant.componentValues)
+            replace(&result.probeValues, with: instant.probeValues)
+            replace(&result.currentValues, with: instant.currentValues)
+            replace(&result.powerValues, with: instant.powerValues)
+            replace(&result.diodeConducts, with: instant.diodeConducts)
+            replace(&result.diodeValues, with: instant.diodeValues)
+        }
+        return result
     }
 
     /// The solution without the values it found, for study mode. What's
@@ -64,12 +179,131 @@ nonisolated struct CircuitSolution {
         solution.diodeValues = [:]
         solution.phases = [:]
         solution.fundamental = nil
+        solution.timelines = []
+        solution.signalFrequency = [:]
         return solution
     }
 
     /// Whether every unknown value was computed and nothing is missing or contradictory.
     var isComplete: Bool {
-        isConsistent && solvedCount == unknownCount && !issues.contains { $0.kind != .notice }
+        isConsistent && solvedCount == unknownCount && !issues.contains { $0.kind == .conflict || $0.kind == .missing }
+    }
+
+    /// Whether something works out but shouldn't be built that way, e.g. an
+    /// LED that gets too much current.
+    var hasWarnings: Bool { issues.contains { $0.kind == .warning } }
+}
+
+/// How a voltage or current goes over one period of a signal generator.
+nonisolated struct MeasuredWave {
+    enum Shape {
+        /// It doesn't change (DC).
+        case constant(Double)
+        /// offset + amplitude · cos(2πft + phase°).
+        case sinusoid(offset: Double, amplitude: Double, phase: Double)
+        /// Constant in each piece of the period (fractions 0…1).
+        case pieces([(start: Double, end: Double, value: Double)])
+    }
+
+    var frequency: Double?
+    var shape: Shape
+
+    /// The value at `time` (seconds).
+    func value(at time: Double) -> Double {
+        let periods = time * (frequency ?? 0)
+        let x = periods - periods.rounded(.down)
+        switch shape {
+        case .constant(let value):
+            return value
+        case .sinusoid(let offset, let amplitude, let phase):
+            return offset + amplitude * cos(2 * .pi * x + phase * .pi / 180)
+        case .pieces(let pieces):
+            return (pieces.first { x < $0.end } ?? pieces.last)?.value ?? 0
+        }
+    }
+
+    /// The average over a period.
+    var mean: Double {
+        switch shape {
+        case .constant(let value): value
+        case .sinusoid(let offset, _, _): offset
+        case .pieces(let pieces): pieces.reduce(0) { $0 + $1.value * ($1.end - $1.start) }
+        }
+    }
+
+    /// The root mean square over a period.
+    var rms: Double {
+        switch shape {
+        case .constant(let value): abs(value)
+        case .sinusoid(let offset, let amplitude, _): sqrt(offset * offset + amplitude * amplitude / 2)
+        case .pieces(let pieces): sqrt(pieces.reduce(0) { $0 + $1.value * $1.value * ($1.end - $1.start) })
+        }
+    }
+
+    /// The value furthest from 0 during a period, with its sign.
+    var peak: Double {
+        switch shape {
+        case .constant(let value): value
+        case .sinusoid(let offset, let amplitude, _): offset < 0 ? offset - abs(amplitude) : offset + abs(amplitude)
+        case .pieces(let pieces): pieces.map(\.value).max { abs($0) < abs($1) } ?? 0
+        }
+    }
+}
+
+/// A part of a circuit with a signal generator and diodes, solved instant
+/// by instant over one period: the period is cut where a square wave
+/// switches (and into 24 steps with a sine), and each piece is solved as DC
+/// with the generators at their value in its middle. Capacitors and
+/// inductors are DC in each instant (open and shorted).
+nonisolated struct SignalTimeline {
+    /// From this frequency (Hz) the sheet shows averages over the period and
+    /// LEDs shine steadily, as bright as they are on average. Faster changes
+    /// can't be shown on a 60 Hz screen and look steady to the eye anyway.
+    static let steadyFrequency = 20.0
+
+    /// A stretch of the period, from `start` to `end` (fractions 0…1), with
+    /// the part's solution then and how bright each LED is (0…1, unlit ones
+    /// left out).
+    struct Segment {
+        var start: Double
+        var end: Double
+        var solution: CircuitSolution
+        var brightness: [UUID: Double]
+    }
+
+    var frequency: Double
+    var segments: [Segment]
+    /// The ids of the part's components, voltage points and currents.
+    var ids: Set<UUID>
+    /// Each LED's brightness averaged over the period (0…1).
+    var averageBrightness: [UUID: Double]
+
+    /// Whether the sheet follows the instants (slow enough to see).
+    var isLive: Bool { frequency < Self.steadyFrequency }
+
+    /// Whether something visibly changes over the period.
+    var isAnimated: Bool { isLive && segments.count > 1 }
+
+    /// The piece of the period at `time` (seconds).
+    func segment(at time: Double) -> Segment? {
+        let x = time * frequency - (time * frequency).rounded(.down)
+        return segments.first { x < $0.end } ?? segments.last
+    }
+
+    /// How brightly an LED is drawn at `time` (seconds), from 0 to 1.
+    func brightness(_ id: UUID, at time: Double) -> Double {
+        guard isLive else { return averageBrightness[id] ?? 0 }
+        return segment(at: time)?.brightness[id] ?? 0
+    }
+
+    /// When the next piece of the period begins after `time` (seconds).
+    func nextChange(after time: Double) -> Double? {
+        guard isAnimated else { return nil }
+        let periods = time * frequency
+        let whole = periods.rounded(.down)
+        let x = periods - whole
+        let next = segments.first(where: { $0.end > x + 1e-9 })?.end ?? 1
+        return (whole + next) / frequency
     }
 }
 
@@ -81,6 +315,9 @@ nonisolated struct SolverIssue: Identifiable, Error {
         case missing
         /// Something the user should know, e.g. there's no ground.
         case notice
+        /// The values can be worked out, but the circuit would break in real
+        /// life, e.g. an LED with too much current.
+        case warning
     }
 
     let id = UUID()
@@ -98,8 +335,9 @@ nonisolated struct SolverIssue: Identifiable, Error {
 /// with Levenberg–Marquardt. A quantity counts as computed only if it's
 /// uniquely determined, which is checked with the rank of the Jacobian.
 ///
-/// Diodes either conduct, with their forward voltage across them, or block,
-/// with no current. Starting with all of them conducting, the circuit is
+/// Diodes either conduct, with their forward voltage across them (an LED
+/// also has its internal resistance, see `LEDModel`), or block, with no
+/// current. Starting with all of them conducting, the circuit is
 /// solved and the diode that fits its state worst (a conducting diode with
 /// current flowing backwards, or a blocking one with more than its forward
 /// voltage across it) is switched, until every diode fits.
@@ -110,12 +348,39 @@ nonisolated struct SolverIssue: Identifiable, Error {
 /// phasors with phase 0. Without one it's DC, where a capacitor is open and
 /// an inductor a short.
 nonisolated enum CircuitSolver {
-    static func solve(_ circuit: Circuit) -> CircuitSolution {
+    /// `diodeGuess` is the diodes to try conducting first (all by default),
+    /// e.g. the ones that conducted a moment before.
+    static func solve(_ circuit: Circuit, diodeGuess: Set<UUID>? = nil) -> CircuitSolution {
         // Switches are wires or nothing; the editor resolves held-down buttons.
+        // A generator at 0 Hz is DC.
+        let zeroFrequency = circuit.components.filter(\.isZeroFrequency)
+        if !zeroFrequency.isEmpty {
+            var solution = solve(circuit.resolvingZeroFrequencyGenerators())
+            solution.issues += zeroFrequency.map { generator in
+                SolverIssue(
+                    kind: .notice,
+                    title: "\(generator.name) er sat til 0 Hz",
+                    detail: "Ved 0 Hz ændrer signalet sig ikke, så \(generator.name) regnes som en jævnspændingskilde med den værdi, signalet starter på (for en sinus A · cos φ, for en firkant høj spænding)."
+                )
+            }
+            return solution
+        }
+        // With a signal generator, the parts it isn't joined to stay DC: each
+        // part is solved on its own.
+        if circuit.isAC {
+            let parts = circuit.resolvingSwitches().separateParts()
+            if parts.count > 1 { return merged(parts.map { solve($0) }, hasGround: !circuit.grounds.isEmpty) }
+        }
         let (circuit, lowSide) = resolvingLowSideOutputs(circuit.resolvingSwitches())
         if !lowSide.isEmpty {
             var solution = solve(circuit)
             solution.issues += lowSide.map(\.issue)
+            return solution
+        }
+        // Phasors can't make a diode conduct one way only, so with diodes the
+        // signal is followed instant by instant.
+        if circuit.isAC, circuit.components.contains(where: { $0.kind.isDiode }),
+           let solution = solveTimeDomain(circuit) {
             return solution
         }
         if circuit.usesFourier { return solveFourier(circuit) }
@@ -132,7 +397,7 @@ nonisolated enum CircuitSolver {
         }
 
         // Switch the worst-fitting diode until all fit.
-        var conducting = Set(diodes.map(\.id))
+        var conducting = diodeGuess.map { $0.intersection(diodes.map(\.id)) } ?? Set(diodes.map(\.id))
         var tried = Set<Set<UUID>>()
         var first: CircuitSolution?
         for _ in 0..<(4 * diodes.count + 1) {
@@ -166,6 +431,40 @@ nonisolated enum CircuitSolver {
             solution.isConsistent = false
         }
         return solution
+    }
+
+    /// The solutions of separate parts of a circuit as one. A part without
+    /// ground of its own doesn't report it when the circuit has one.
+    private static func merged(_ parts: [CircuitSolution], hasGround: Bool) -> CircuitSolution {
+        var result = CircuitSolution()
+        var titles = Set<String>()
+        for part in parts {
+            result.componentValues.merge(part.componentValues) { a, _ in a }
+            result.probeValues.merge(part.probeValues) { a, _ in a }
+            result.currentValues.merge(part.currentValues) { a, _ in a }
+            result.powerValues.merge(part.powerValues) { a, _ in a }
+            result.diodeConducts.merge(part.diodeConducts) { a, _ in a }
+            result.diodeValues.merge(part.diodeValues) { a, _ in a }
+            result.ledOvercurrent.merge(part.ledOvercurrent) { a, _ in a }
+            result.timelines += part.timelines
+            result.signalFrequency.merge(part.signalFrequency) { a, _ in a }
+            result.phases.merge(part.phases) { a, _ in a }
+            result.isConsistent = result.isConsistent && part.isConsistent
+            result.unknownCount += part.unknownCount
+            result.solvedCount += part.solvedCount
+            result.frequency = result.frequency ?? part.frequency
+            if let fundamental = part.fundamental {
+                var values = result.fundamental ?? PhasorValues(frequency: fundamental.frequency)
+                values.values.merge(fundamental.values) { a, _ in a }
+                values.phases.merge(fundamental.phases) { a, _ in a }
+                result.fundamental = values
+            }
+            for issue in part.issues where titles.insert(issue.title).inserted {
+                if hasGround, issue.title == "Der mangler et stel (0 V)" { continue }
+                result.issues.append(issue)
+            }
+        }
+        return result
     }
 
     /// A low-side output (LSO) as the square wave it gives: between 0 V
@@ -248,6 +547,7 @@ nonisolated enum CircuitSolver {
             for (id, value) in fundamental.currentValues { values.values[id] = value }
             values.phases = fundamental.phases
             solution.fundamental = values
+            for id in values.values.keys { solution.signalFrequency[id] = frequency }
             for (id, power) in fundamental.powerValues {
                 solution.powerValues[id] = solution.powerValues[id].map { $0 + power }
             }
@@ -263,6 +563,120 @@ nonisolated enum CircuitSolver {
             detail: "Værdierne er middelværdier (fx firkant = D · højspænding, kondensatorer afbrudt og spoler kortsluttet). Efter ~ står grundtonen: amplitude og fase af signalets første Fourier-led (for en firkant (2A/π)·sin(πD)) ved generatorens frekvens. Effekten er middelværdiens plus grundtonens; de højere harmoniske er udeladt."
         ))
         return solution
+    }
+
+    /// Solves a circuit with signal generators and diodes instant by instant
+    /// over a period (`SignalTimeline`). The values are averages over the
+    /// period, with the instants in `timelines`. `nil` when a generator's
+    /// value or the frequency is missing; then it's solved with phasors.
+    private static func solveTimeDomain(_ circuit: Circuit) -> CircuitSolution? {
+        let generators = circuit.components.filter { $0.kind == .signalGenerator }
+        guard !generators.isEmpty, generators.allSatisfy({ $0.value != nil }),
+              case .success(let frequency) = circuit.acFrequency() else { return nil }
+
+        func fraction(_ x: Double) -> Double { x - x.rounded(.down) }
+        var cuts: Set<Double> = [0, 1]
+        for generator in generators {
+            let shift = (generator.phase ?? 0) / 360
+            switch generator.signalWaveform {
+            case .sine:
+                for step in 0..<24 { cuts.insert(Double(step) / 24) }
+            case .square:
+                cuts.insert(fraction(-shift))
+                cuts.insert(fraction(generator.dutyFraction - shift))
+            }
+        }
+        let sorted = cuts.sorted()
+        let leds = circuit.components.filter { $0.kind == .led }
+
+        // Pieces where the generators have the same values are solved once,
+        // each starting from the diodes that conducted in the piece before.
+        var solved: [[Double]: CircuitSolution] = [:]
+        var segments: [SignalTimeline.Segment] = []
+        var guess: Set<UUID>?
+        for (start, end) in zip(sorted, sorted.dropFirst()) where end - start > 1e-9 {
+            let middle = (start + end) / 2
+            var instant = circuit
+            var values: [Double] = []
+            for index in instant.components.indices where instant.components[index].kind == .signalGenerator {
+                let generator = instant.components[index]
+                let value = generator.signalWaveform.value(
+                    generator.value ?? 0, duty: generator.dutyFraction, at: middle + (generator.phase ?? 0) / 360
+                )
+                values.append(value)
+                instant.components[index].kind = .voltageSource
+                instant.components[index].value = value
+            }
+            let solution = solved[values] ?? solve(instant, diodeGuess: guess)
+            solved[values] = solution
+            guess = Set(solution.diodeConducts.filter(\.value).keys)
+            var brightness: [UUID: Double] = [:]
+            for led in leds {
+                let value = solution.ledBrightness(led.id, at: 0)
+                if value > 0 { brightness[led.id] = value }
+            }
+            segments.append(SignalTimeline.Segment(start: start, end: end, solution: solution, brightness: brightness))
+        }
+        guard let first = segments.first?.solution else { return nil }
+
+        // Averages over the period, of what's known in every instant.
+        func average(_ values: (CircuitSolution) -> [UUID: Double]) -> [UUID: Double] {
+            var result = values(first)
+            for segment in segments.dropFirst() {
+                let these = values(segment.solution)
+                result = result.filter { these[$0.key] != nil }
+            }
+            for id in result.keys {
+                result[id] = segments.reduce(0) { $0 + (values($1.solution)[id] ?? 0) * ($1.end - $1.start) }
+            }
+            return result
+        }
+        var result = CircuitSolution()
+        result.componentValues = average(\.componentValues)
+        result.probeValues = average(\.probeValues)
+        result.currentValues = average(\.currentValues)
+        result.powerValues = average(\.powerValues)
+        result.unknownCount = first.unknownCount
+        result.solvedCount = segments.map(\.solution.solvedCount).min() ?? 0
+        result.isConsistent = segments.allSatisfy(\.solution.isConsistent)
+        var averageBrightness: [UUID: Double] = [:]
+        for segment in segments {
+            let length = segment.end - segment.start
+            for (id, conducts) in segment.solution.diodeConducts where conducts { result.diodeConducts[id] = true }
+            for (id, value) in segment.solution.diodeValues {
+                let sum = result.diodeValues[id] ?? (0, 0)
+                result.diodeValues[id] = (sum.voltage + value.voltage * length, sum.current + value.current * length)
+            }
+            for (id, value) in segment.brightness { averageBrightness[id, default: 0] += value * length }
+            for (id, current) in segment.solution.ledOvercurrent {
+                result.ledOvercurrent[id] = max(result.ledOvercurrent[id] ?? 0, current)
+            }
+        }
+        for diode in circuit.components where diode.kind.isDiode && result.diodeConducts[diode.id] == nil {
+            result.diodeConducts[diode.id] = false
+        }
+
+        // Each problem once; an LED's warning with its highest current.
+        let names = Dictionary(circuit.components.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let overcurrentTitles = Set(result.ledOvercurrent.keys.compactMap { names[$0] }.map { LEDModel.overcurrentIssue(name: $0, current: 0).title })
+        var titles = overcurrentTitles
+        for segment in segments {
+            for issue in segment.solution.issues where titles.insert(issue.title).inserted { result.issues.append(issue) }
+        }
+        for (id, current) in result.ledOvercurrent.sorted(by: { (names[$0.key] ?? "") < (names[$1.key] ?? "") }) {
+            result.issues.append(LEDModel.overcurrentIssue(name: names[id] ?? "", current: current))
+        }
+        result.issues.append(SolverIssue(
+            kind: .notice,
+            title: "Signalet følges øjeblik for øjeblik",
+            detail: "Med dioder og en signalgenerator regnes kredsløbet i hvert øjeblik af perioden med generatorens værdi lige da (kondensatorer afbrudt og spoler kortsluttet i hvert øjeblik). Under \(SIValue.format(SignalTimeline.steadyFrequency, unit: "Hz")) viser tegningen værdierne, som de er lige nu; derover og i editoren er de middelværdier over perioden."
+        ))
+
+        var ids = Set(circuit.components.map(\.id))
+        ids.formUnion(circuit.probes.map(\.id))
+        ids.formUnion(circuit.currents.map(\.id))
+        result.timelines = [SignalTimeline(frequency: frequency, segments: segments, ids: ids, averageBrightness: averageBrightness)]
+        return result
     }
 
     /// Solves a circuit with signal generators with phasors.
@@ -282,6 +696,9 @@ nonisolated enum CircuitSolver {
         var model = Model(circuit: circuit, omega: 2 * .pi * frequency)
         var solution = model.solve()
         solution.frequency = frequency
+        for id in Array(solution.probeValues.keys) + Array(solution.currentValues.keys) {
+            solution.signalFrequency[id] = frequency
+        }
         if circuit.components.contains(where: { $0.kind.isDiode }) {
             solution.issues.append(SolverIssue(
                 kind: .notice,
@@ -523,8 +940,8 @@ nonisolated extension CircuitSolver {
 
     /// Req with controlled sources and diodes, by modified nodal analysis:
     /// independent sources off, controlled sources on, diodes in their solved
-    /// state without their threshold voltage (conducting is a short, blocking
-    /// is open), and 1 A sent in at `nodeA` and out at `nodeB`. Req is the
+    /// state without their threshold voltage (conducting is a short, or an
+    /// LED's internal resistance; blocking is open), and 1 A sent in at `nodeA` and out at `nodeB`. Req is the
     /// voltage that gives. `nil` if a control is missing or there's no single
     /// solution. In AC (`omega`) capacitors and inductors have their
     /// impedance and diodes are open.
@@ -581,8 +998,8 @@ nonisolated extension CircuitSolver {
                 Set([node(component.start), node(component.end)]) != ends
             case .vcvs, .ccvs: true
             case .resistor, .inductor: impedance(component)?.magnitude == 0
-            case .diode, .led: omega == nil && solution.diodeConducts[component.id] == true
-            case .currentSource, .vccs, .cccs, .capacitor, .toggleSwitch, .pushButton: false
+            case .diode: omega == nil && solution.diodeConducts[component.id] == true
+            case .led, .currentSource, .vccs, .cccs, .capacitor, .toggleSwitch, .pushButton: false
             }
             if setsVoltage {
                 branch[component.id] = count
@@ -619,6 +1036,8 @@ nonisolated extension CircuitSolver {
                 return scaled(difference(p, q), .one / z)
             case .vccs, .cccs:
                 return controlRow(component).map { scaled($0, Complex(component.value ?? 0)) }
+            case .led where omega == nil && solution.diodeConducts[component.id] == true:
+                return scaled(difference(p, q), Complex(1 / LEDModel.resistance))
             default:
                 // Switched-off and taken-out sources, blocking diodes.
                 return [:]
@@ -669,6 +1088,99 @@ nonisolated extension CircuitSolver {
             if i.reduce(Complex.zero, { $0 + $1.value * x[$1.key] }).magnitude > 1e-9 { used.insert(component.id) }
         }
         return .of(x[ia], resistors: used)
+    }
+}
+
+nonisolated extension Circuit {
+    /// The circuit split into the parts that aren't joined by wires or
+    /// components, each with its own items. Grounds don't join parts: no
+    /// current flows between them through ground, so each can be solved on
+    /// its own (e.g. a part with a signal generator with phasors, the rest
+    /// as DC). A controlled source stays with what controls it, and a voltage
+    /// drop joins its two points. Items on no part go with the first.
+    func separateParts() -> [Circuit] {
+        var bare = self
+        bare.grounds = []
+        let netlist = Netlist(bare)
+        var parent = Array(0..<netlist.nodeCount)
+        func find(_ n: Int) -> Int {
+            var n = n
+            while parent[n] != n { n = parent[n] }
+            return n
+        }
+        func join(_ a: Int?, _ b: Int?) {
+            guard let a, let b else { return }
+            let (ra, rb) = (find(a), find(b))
+            if ra != rb { parent[ra] = rb }
+        }
+        func node(_ point: GridPoint) -> Int? { netlist.node(at: point) }
+        let componentByID = Dictionary(components.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for component in components { join(node(component.start), node(component.end)) }
+        for sense in senses {
+            if let owner = componentByID[sense.ownerID] { join(node(sense.gridPoint), node(owner.start)) }
+        }
+        for probe in probes {
+            if let negative = probe.negative { join(node(probe.position), node(negative)) }
+        }
+
+        // One part per group of components, in the order they come.
+        var partOfRoot: [Int: Int] = [:]
+        for component in components {
+            guard let root = node(component.start).map(find), partOfRoot[root] == nil else { continue }
+            partOfRoot[root] = partOfRoot.count
+        }
+        guard partOfRoot.count > 1 else { return [self] }
+        var empty = self
+        empty.components = []
+        empty.wires = []
+        empty.probes = []
+        empty.currents = []
+        empty.grounds = []
+        empty.senses = []
+        empty.meshMarkers = []
+        var parts = Array(repeating: empty, count: partOfRoot.count)
+        func part(_ point: GridPoint?) -> Int {
+            point.flatMap(node).map(find).flatMap { partOfRoot[$0] } ?? 0
+        }
+        for component in components { parts[part(component.start)].components.append(component) }
+        let wireByID = Dictionary(wires.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for wire in wires { parts[part(wire.start)].wires.append(wire) }
+        for probe in probes { parts[part(probe.position)].probes.append(probe) }
+        for arrow in currents { parts[part(wireByID[arrow.wireID]?.start)].currents.append(arrow) }
+        for ground in grounds { parts[part(ground.position)].grounds.append(ground) }
+        for sense in senses { parts[part(componentByID[sense.ownerID]?.start)].senses.append(sense) }
+        parts[0].meshMarkers = meshMarkers
+        return parts
+    }
+
+    /// The circuit with each conducting LED replaced by its model: a voltage
+    /// source Vk (+ towards the anode, with the LED's id and name) in series
+    /// with its internal resistance rd, joined at a grid point inside the LED
+    /// (so the circuit stays planar for the mesh method), or one far off the
+    /// sheet for an LED only one grid unit long. For the walkthrough and
+    /// Maple, which work with sources and resistors. Also returns the
+    /// resistors added, by LED id.
+    func splittingLEDs(conducting: Set<UUID>) -> (circuit: Circuit, resistors: [UUID: CircuitComponent]) {
+        var result = self
+        var resistors: [UUID: CircuitComponent] = [:]
+        for (index, led) in components.enumerated() where led.kind == .led && conducting.contains(led.id) {
+            let dx = led.end.x - led.start.x, dy = led.end.y - led.start.y
+            let length = max(abs(dx), abs(dy))
+            let inner = length >= 2
+                ? GridPoint(x: led.start.x + dx / length * (length / 2), y: led.start.y + dy / length * (length / 2))
+                : GridPoint(x: -1_000_000 - index, y: -1_000_000)
+            let resistor = CircuitComponent(
+                kind: .resistor, start: led.start, end: inner, name: "rd_{\(led.name)}", value: LEDModel.resistance
+            )
+            result.components.removeAll { $0.id == led.id }
+            // A voltage source has + at its end.
+            result.components.append(CircuitComponent(
+                id: led.id, kind: .voltageSource, start: led.end, end: inner, name: led.name, value: led.value
+            ))
+            result.components.append(resistor)
+            resistors[led.id] = resistor
+        }
+        return (result, resistors)
     }
 }
 
@@ -1098,9 +1610,11 @@ nonisolated private struct Model {
                 equation.linear[current] = 1
             case .diode, .led:
                 if omega == nil, conducting.contains(component.id) {
-                    // v(anode) − v(cathode) − Vf = 0, with the anode at the start terminal
+                    // v(anode) − v(cathode) − Vf = 0, with the anode at the start
+                    // terminal; an LED has its internal resistance too: − rd·i
                     if let start { equation.linear[start, default: 0] += 1 }
                     if let end { equation.linear[end, default: 0] -= 1 }
+                    if component.kind == .led { equation.linear[current, default: 0] -= LEDModel.resistance }
                     if let value = component.value {
                         equation.constant = -value
                     } else if let parameter = parameterVariable[component.id] {
@@ -1369,6 +1883,10 @@ nonisolated private struct Model {
                 let start = self.voltage(at: component.start).map { x[$0] } ?? 0
                 let end = self.voltage(at: component.end).map { x[$0] } ?? 0
                 solution.diodeValues[component.id] = (voltage: start - end, current: x[current])
+                if component.kind == .led, x[current] > LEDModel.ratedCurrent * (1 + 1e-6) {
+                    issues.append(LEDModel.overcurrentIssue(name: component.name, current: x[current]))
+                    solution.ledOvercurrent[component.id] = x[current]
+                }
             }
         }
 
@@ -1409,6 +1927,11 @@ nonisolated private struct Model {
     /// stuck. Returns the first solution that satisfies all equations, or the
     /// best one found.
     private func bestSolution() -> [Double] {
+        // Without unknown resistances every equation is linear, and one
+        // least-squares step from the start is the answer, when it's unique.
+        if equations.allSatisfy({ $0.bilinear.isEmpty && $0.exponential.isEmpty }), let x = linearSolution() {
+            return x
+        }
         let logResistances = kinds.indices.filter { kinds[$0] == .logResistance }
         var starts = [initial]
         if !logResistances.isEmpty {
@@ -1438,6 +1961,30 @@ nonisolated private struct Model {
             if result.cost < (best?.cost ?? .infinity) { best = result }
         }
         return best?.x ?? initial
+    }
+
+    /// The least-squares solution of linear equations (rows scaled like in
+    /// `levenbergMarquardt`), or `nil` if it isn't unique; then some values
+    /// are free, and the damped search keeps them near their start.
+    private func linearSolution() -> [Double]? {
+        let count = kinds.count
+        var normal = [[Double]](repeating: [Double](repeating: 0, count: count), count: count)
+        var rhs = [Double](repeating: 0, count: count)
+        for equation in equations {
+            let gradient = equation.gradient(initial, count: count)
+            let norm = sqrt(gradient.reduce(0) { $0 + $1 * $1 })
+            let weight = norm > 1e-12 ? 1 / norm : 1
+            let residual = equation.value(initial) * weight
+            let nonzero = gradient.indices.filter { gradient[$0] != 0 }
+            for i in nonzero {
+                let gi = gradient[i] * weight
+                rhs[i] -= gi * residual
+                for j in nonzero { normal[i][j] += gi * gradient[j] * weight }
+            }
+        }
+        guard let step = LinearAlgebra.solveRegular(normal, rhs) else { return nil }
+        let x = zip(initial, step).map(+)
+        return x.allSatisfy(\.isFinite) ? x : nil
     }
 
     /// Finds a point near `start` where all equations hold as well as possible.
@@ -1591,6 +2138,35 @@ nonisolated enum LinearAlgebra {
         for column in 0..<n {
             guard let pivot = (column..<n).max(by: { abs(a[$0][column]) < abs(a[$1][column]) }),
                   abs(a[pivot][column]) > 1e-300 else { return nil }
+            a.swapAt(column, pivot)
+            b.swapAt(column, pivot)
+            for row in (column + 1)..<n where a[row][column] != 0 {
+                let factor = a[row][column] / a[column][column]
+                for k in column..<n { a[row][k] -= factor * a[column][k] }
+                b[row] -= factor * b[column]
+            }
+        }
+        var x = [Double](repeating: 0, count: n)
+        for row in stride(from: n - 1, through: 0, by: -1) {
+            var sum = b[row]
+            for k in (row + 1)..<n { sum -= a[row][k] * x[k] }
+            x[row] = sum / a[row][row]
+        }
+        return x
+    }
+
+    /// Solves a square system, or `nil` if it's singular or nearly so (a
+    /// pivot below 1e-11 of the largest), so free directions aren't given
+    /// arbitrary huge values.
+    static func solveRegular(_ matrix: [[Double]], _ vector: [Double]) -> [Double]? {
+        let n = vector.count
+        var a = matrix
+        var b = vector
+        let largest = matrix.flatMap { $0.map(abs) }.max() ?? 0
+        guard largest > 0 else { return n == 0 ? [] : nil }
+        for column in 0..<n {
+            guard let pivot = (column..<n).max(by: { abs(a[$0][column]) < abs(a[$1][column]) }),
+                  abs(a[pivot][column]) > 1e-11 * largest else { return nil }
             a.swapAt(column, pivot)
             b.swapAt(column, pivot)
             for row in (column + 1)..<n where a[row][column] != 0 {

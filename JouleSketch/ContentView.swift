@@ -10,6 +10,9 @@ struct ContentView: View {
     @State private var showSolverReport = false
     @State private var showMapleExport = false
     @State private var showGuide = false
+    /// The truth table panel of a digital sheet.
+    @State private var showLogic = false
+    @State private var showLibrary = false
     @State private var canvasSize: CGSize = .zero
     /// Space between the tool palette and the window's sides.
     private static let paletteMargin: CGFloat = 16
@@ -29,10 +32,33 @@ struct ContentView: View {
         #endif
     }
 
+    /// Whether the truth table panel lies beside the sheet. On an iPhone
+    /// there is no room, so it is a window there.
+    private var logicDocked: Bool {
+        #if os(iOS)
+        sizeClass != .compact
+        #else
+        true
+        #endif
+    }
+
     var body: some View {
         HStack(spacing: 0) {
-            sheet
-            if showMapleExport && walkthroughDocked {
+            if editor.needsModeChoice {
+                // A new document starts by choosing analog or digital.
+                StartView(editor: editor)
+            } else {
+                sheet
+            }
+            if showLogic && logicDocked && editor.isDigital && !editor.needsModeChoice {
+                Divider()
+                    .ignoresSafeArea(edges: .bottom)
+                LogicPanelView(editor: editor) { showLogic = false }
+                    .frame(width: 460)
+                    .clipped()
+                    .ignoresSafeArea(edges: .bottom)
+            }
+            if showMapleExport && walkthroughDocked && !editor.isDigital {
                 Divider()
                     .ignoresSafeArea(edges: .bottom)
                 // Follows the drawing as it is edited.
@@ -59,6 +85,12 @@ struct ContentView: View {
         )) {
             // Without what lies in excluded areas.
             MapleExportView(circuit: editor.calculationCircuit)
+        }
+        .sheet(isPresented: Binding(
+            get: { showLogic && !logicDocked && editor.isDigital },
+            set: { if !$0 { showLogic = false } }
+        )) {
+            LogicPanelView(editor: editor, isDocked: false)
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
@@ -99,6 +131,13 @@ struct ContentView: View {
                         .padding(.horizontal, Self.paletteMargin)
                 }
             }
+            .overlay(alignment: .top) {
+                // Inside a block: the way back out.
+                if editor.isInsideBlock {
+                    BlockTrailView(editor: editor)
+                        .padding(.top, 10)
+                }
+            }
             // The palette tells the sheet where it is, in the sheet's coordinates.
             .coordinateSpace(.named(ToolPalette.sheetSpace))
             .sheet(isPresented: $showGuide) {
@@ -112,6 +151,22 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        if editor.needsModeChoice {
+            ToolbarItem {
+                Button("Sådan bruger du JouleSketch", systemImage: "info.circle") {
+                    showGuide = true
+                }
+                .sheet(isPresented: $showGuide) {
+                    UserGuideView()
+                }
+            }
+        } else {
+            sheetToolbar
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var sheetToolbar: some ToolbarContent {
         ToolbarItemGroup {
             // ⌘Z and ⇧⌘Z come from the system's Edit menu in document apps.
             Button("Fortryd", systemImage: "arrow.uturn.backward") { editor.undo() }
@@ -120,6 +175,85 @@ struct ContentView: View {
                 .disabled(!editor.canRedo)
         }
 
+        if editor.isDigital {
+            ToolbarItem {
+                Toggle("Sandhedstabel", systemImage: "tablecells", isOn: $showLogic)
+                    .help("Sandhedstabel og Karnaugh-kort for kredsløbet, og lommeregneren, der finder de gates, en sandhedstabel kræver")
+            }
+            ToolbarItem {
+                Button("Bibliotek", systemImage: "books.vertical") { showLibrary.toggle() }
+                    .help("Dine gemte blokke: placér, gem, eksportér og importér")
+                    .popover(isPresented: $showLibrary) {
+                        BlockLibraryView(editor: editor)
+                    }
+            }
+        } else {
+            analogToolbar
+        }
+
+        ToolbarItem {
+            // Highlighted while drawing mode is on.
+            Toggle("Tegn", systemImage: "pencil", isOn: Binding(
+                get: { editor.isDrawing },
+                set: { editor.isDrawing = $0 }
+            ))
+            .help("Tegn frit på siden (skjuler værktøjerne)")
+        }
+
+        ToolbarItemGroup {
+            Button("Slet", systemImage: "trash") { editor.deleteSelection() }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(editor.selection == nil)
+
+            Menu("Visning", systemImage: "ellipsis") {
+                Button("Zoom ind", systemImage: "plus.magnifyingglass") {
+                    editor.zoom(by: 1.25, around: canvasCenter)
+                }
+                .keyboardShortcut("+", modifiers: .command)
+                Button("Zoom ud", systemImage: "minus.magnifyingglass") {
+                    editor.zoom(by: 0.8, around: canvasCenter)
+                }
+                .keyboardShortcut("-", modifiers: .command)
+                Button("Nulstil visning", systemImage: "arrow.counterclockwise") {
+                    editor.resetView()
+                }
+                .keyboardShortcut("0", modifiers: .command)
+                if !editor.isDigital {
+                    Divider()
+                    // Also here, since the switch in the toolbar can't go into
+                    // the overflow menu on narrow screens.
+                    Toggle("Study mode", systemImage: "graduationcap", isOn: $studyMode)
+                }
+                Divider()
+                Button("Ryd tegning", systemImage: "xmark.bin", role: .destructive) {
+                    editor.clearAll()
+                }
+                Divider()
+                Button("Sådan bruger du JouleSketch", systemImage: "info.circle") {
+                    showGuide = true
+                }
+                #if os(macOS)
+                SettingsLink {
+                    Label("Indstillinger…", systemImage: "gearshape")
+                }
+                #else
+                Button("Indstillinger", systemImage: "gearshape") {
+                    showSettings = true
+                }
+                .keyboardShortcut(",", modifiers: .command)
+                #endif
+            }
+
+            Button("Egenskaber", systemImage: "sidebar.trailing") {
+                showInspector.toggle()
+            }
+            .keyboardShortcut("i", modifiers: [.command, .option])
+        }
+    }
+
+    /// Study mode, the calculation report and the Maple output of an analog sheet.
+    @ToolbarContentBuilder
+    private var analogToolbar: some ToolbarContent {
         ToolbarItem {
             HStack(spacing: 6) {
                 Text("Study mode")
@@ -153,63 +287,6 @@ struct ContentView: View {
             .help(editor.solution.isComplete
                   ? "Knudepunktsmetoden som Maple-kode, klar til at kopiere"
                   : "Maple-output kræver, at alle ukendte værdier kan beregnes – se Beregning")
-        }
-
-        ToolbarItem {
-            // Highlighted while drawing mode is on.
-            Toggle("Tegn", systemImage: "pencil", isOn: Binding(
-                get: { editor.isDrawing },
-                set: { editor.isDrawing = $0 }
-            ))
-            .help("Tegn frit på siden (skjuler værktøjerne)")
-        }
-
-        ToolbarItemGroup {
-            Button("Slet", systemImage: "trash") { editor.deleteSelection() }
-                .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(editor.selection == nil)
-
-            Menu("Visning", systemImage: "ellipsis") {
-                Button("Zoom ind", systemImage: "plus.magnifyingglass") {
-                    editor.zoom(by: 1.25, around: canvasCenter)
-                }
-                .keyboardShortcut("+", modifiers: .command)
-                Button("Zoom ud", systemImage: "minus.magnifyingglass") {
-                    editor.zoom(by: 0.8, around: canvasCenter)
-                }
-                .keyboardShortcut("-", modifiers: .command)
-                Button("Nulstil visning", systemImage: "arrow.counterclockwise") {
-                    editor.resetView()
-                }
-                .keyboardShortcut("0", modifiers: .command)
-                Divider()
-                // Also here, since the switch in the toolbar can't go into
-                // the overflow menu on narrow screens.
-                Toggle("Study mode", systemImage: "graduationcap", isOn: $studyMode)
-                Divider()
-                Button("Ryd tegning", systemImage: "xmark.bin", role: .destructive) {
-                    editor.clearAll()
-                }
-                Divider()
-                Button("Sådan bruger du JouleSketch", systemImage: "info.circle") {
-                    showGuide = true
-                }
-                #if os(macOS)
-                SettingsLink {
-                    Label("Indstillinger…", systemImage: "gearshape")
-                }
-                #else
-                Button("Indstillinger", systemImage: "gearshape") {
-                    showSettings = true
-                }
-                .keyboardShortcut(",", modifiers: .command)
-                #endif
-            }
-
-            Button("Egenskaber", systemImage: "sidebar.trailing") {
-                showInspector.toggle()
-            }
-            .keyboardShortcut("i", modifiers: [.command, .option])
         }
     }
 }

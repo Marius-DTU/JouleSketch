@@ -95,11 +95,11 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
     }
 
     /// The value a newly placed component starts with: a typical forward
-    /// voltage for diodes, unknown for everything else.
+    /// voltage for diodes (a red LED's knee voltage), unknown for everything else.
     var defaultValue: Double? {
         switch self {
         case .diode: 0.7
-        case .led: 2
+        case .led: LEDColor.red.kneeVoltage
         default: nil
         }
     }
@@ -164,6 +164,7 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
 
     var valueTitle: String? {
         if isDependent { return displayUnit.isEmpty ? "Faktor \(gainSymbol)" : "Faktor \(gainSymbol) (\(displayUnit))" }
+        if self == .led { return "Knæspænding (V)" }
         if isDiode { return "Tærskelspænding (V)" }
         switch self {
         case .capacitor: return "Kapacitans (F)"
@@ -175,6 +176,114 @@ nonisolated enum ComponentKind: String, Codable, CaseIterable, Identifiable {
 
     /// Resistances, capacitances, inductances and forward voltages can't be negative.
     var allowsNegativeValue: Bool { self != .resistor && !isDiode && !isReactive }
+}
+
+/// How an LED is worked out: it blocks below its knee voltage Vk (its
+/// value) and above it conducts through a small internal resistance, so
+/// v = Vk + rd·i. It shines brighter with more current, fully at the rated
+/// current; more than that burns it out without a series resistor.
+nonisolated enum LEDModel {
+    /// The internal resistance rd in Ω: 20 mA gives Vk + 0,3 V, about what
+    /// LED data sheets give.
+    static let resistance = 15.0
+    /// The rated current in A, where the LED is fully lit.
+    static let ratedCurrent = 0.02
+
+    /// How bright an LED carrying `current` (A, anode to cathode) is drawn,
+    /// 0…1. The light follows the current, but the eye sees brightness about
+    /// as its cube root (like CIE lightness), so a few mA already look clearly
+    /// lit: 1 mA ≈ 0,37, 5 mA ≈ 0,63, 20 mA = 1.
+    static func brightness(current: Double) -> Double {
+        cbrt(min(max(current / ratedCurrent, 0), 1))
+    }
+
+    /// The warning for an LED with more than its rated current.
+    static func overcurrentIssue(name: String, current: Double) -> SolverIssue {
+        SolverIssue(
+            kind: .warning,
+            title: "\(name) får for meget strøm",
+            detail: "Strømmen gennem \(name) er \(SIValue.format(current, unit: "A")), men en lysdiode tåler omkring \(SIValue.format(ratedCurrent, unit: "A")) og brænder af ved mere. Sæt en formodstand i serie med den: R = (U − V_LED) / \(SIValue.format(ratedCurrent, unit: "A"))."
+        )
+    }
+}
+
+/// What a voltage point or current arrow shows of a value that changes
+/// with a signal generator, picked in its editor.
+nonisolated enum MeasureMode: String, Codable, CaseIterable, Identifiable {
+    /// As worked out: amplitude ∠ phase with phasors, the average (and the
+    /// fundamental after ~) with a square wave, right now with diodes.
+    case auto
+    /// The value right now, changing with the signal (below
+    /// `SignalTimeline.steadyFrequency`; faster it shows the RMS).
+    case instant
+    /// The average over a period, like a multimeter on DC.
+    case average
+    /// The root mean square over a period, like a multimeter on AC.
+    case rms
+    /// The value furthest from 0 during a period.
+    case peak
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .auto: "Automatisk"
+        case .instant: "Øjebliksværdi (svinger)"
+        case .average: "Middelværdi"
+        case .rms: "RMS (effektivværdi)"
+        case .peak: "Spidsværdi"
+        }
+    }
+
+    /// Written after the value on the sheet.
+    var suffix: String {
+        switch self {
+        case .auto: ""
+        case .instant: "nu"
+        case .average: "middel"
+        case .rms: "rms"
+        case .peak: "spids"
+        }
+    }
+}
+
+/// An LED's color, picked in its editor, with a typical knee voltage. Picking
+/// a color sets the LED's value to it.
+nonisolated enum LEDColor: String, Codable, CaseIterable, Identifiable {
+    case red
+    case yellow
+    case blue
+    case white
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .red: "Rød"
+        case .yellow: "Gul"
+        case .blue: "Blå"
+        case .white: "Hvid"
+        }
+    }
+
+    /// Where it starts to conduct; at 20 mA it's 0,3 V more (`LEDModel`).
+    var kneeVoltage: Double {
+        switch self {
+        case .red: 1.8
+        case .yellow: 1.9
+        case .blue, .white: 2.7
+        }
+    }
+
+    /// The light drawn when it's lit. White is a cool white, so it shows on the sheet.
+    var light: SceneColor {
+        switch self {
+        case .red: SceneColor(1, 0.15, 0.1)
+        case .yellow: SceneColor(1, 0.72, 0)
+        case .blue: SceneColor(0.15, 0.45, 1)
+        case .white: SceneColor(0.6, 0.78, 1)
+        }
+    }
 }
 
 /// What a signal generator sends out, picked in its editor. A sine is
@@ -224,6 +333,17 @@ nonisolated enum SignalWaveform: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .sine: Complex(a)
         case .square: Complex(magnitude: 2 * a / .pi * sin(.pi * d), degrees: -180 * d)
+        }
+    }
+
+    /// The value at `x` periods into the waveform (the generator's phase
+    /// included), matching `seriesLatex`: A·cos(2πx), or a square wave that's
+    /// A for the first fraction `d` of each period and 0 for the rest.
+    func value(_ a: Double, duty d: Double, at x: Double) -> Double {
+        let x = x - x.rounded(.down)
+        switch self {
+        case .sine: return a * cos(2 * .pi * x)
+        case .square: return x < d ? a : 0
         }
     }
 
@@ -286,6 +406,11 @@ nonisolated struct CircuitComponent: Identifiable, Codable, Hashable {
     var isNormallyClosed: Bool { kind == .pushButton && normallyClosed == true }
     /// A signal generator's duty cycle in percent (square wave); `nil` means 50 %.
     var dutyCycle: Double?
+    /// An LED's color; `nil` means red.
+    var color: LEDColor?
+
+    /// An LED's color, red when not set.
+    var ledColor: LEDColor { color ?? .red }
 
     /// A signal generator's waveform, a sine when not set.
     var signalWaveform: SignalWaveform { waveform ?? .sine }
@@ -296,6 +421,8 @@ nonisolated struct CircuitComponent: Identifiable, Codable, Hashable {
     /// 0 V works like an open-drain output, open (high) for the duty cycle and
     /// pulling its + terminal down to − for the rest of each period.
     var isLowSideOutput: Bool { kind == .signalGenerator && signalWaveform == .square && value == 0 }
+    /// Whether this is a signal generator set to 0 Hz, which is DC.
+    var isZeroFrequency: Bool { kind == .signalGenerator && frequency == 0 }
     /// The duty cycle as a fraction from 0 to 1.
     var dutyFraction: Double { min(max((dutyCycle ?? 50) / 100, 0), 1) }
 
@@ -448,6 +575,8 @@ nonisolated struct CurrentArrow: Identifiable, Codable, Hashable {
     var value: Double?
     /// Free-form note written by the user.
     var note = ""
+    /// What the computed current shows; `nil` means `.auto`.
+    var measure: MeasureMode?
 
     var anchor: CGPoint {
         get { CGPoint(x: anchorX, y: anchorY) }
@@ -491,6 +620,8 @@ nonisolated struct Probe: Identifiable, Codable, Hashable {
     var note = ""
     /// The − point of a voltage drop; `nil` for a plain voltage point.
     var negative: GridPoint?
+    /// What the computed voltage shows; `nil` means `.auto`.
+    var measure: MeasureMode?
     /// How far a voltage drop's label sits out from the middle between its
     /// points (grid units); `nil` for the default.
     var labelOffset: Double?
@@ -755,8 +886,26 @@ nonisolated struct Circuit: Codable, Hashable {
     var meshMarkers: [MeshMarker] = []
     /// Named boxes dividing the sheet into groups for the Maple window.
     var groupAreas: [GroupArea] = []
+    /// Logic gates, inputs and outputs on a digital sheet.
+    var gates: [LogicGate] = []
+    /// Analog or digital, chosen on the start page; `nil` until then. Files
+    /// from before there was a choice are analog.
+    var mode: SheetMode?
+    /// The order of the inputs and outputs in the truth table, by name, as
+    /// the user arranged them; names not in it follow alphabetically.
+    var logicColumnOrder: [String]?
 
     init() {}
+
+    /// Analog unless the sheet was made digital.
+    var sheetMode: SheetMode { mode ?? .analog }
+
+    /// Whether nothing at all is on the sheet.
+    var isEmpty: Bool {
+        var bare = self
+        bare.mode = nil
+        return bare == Circuit()
+    }
 
     /// Missing lists decode as empty, so files saved before a kind of item
     /// existed (e.g. ground symbols) still open.
@@ -775,6 +924,9 @@ nonisolated struct Circuit: Codable, Hashable {
         excludedAreas = try container.decodeIfPresent([ExcludedArea].self, forKey: .excludedAreas) ?? []
         meshMarkers = try container.decodeIfPresent([MeshMarker].self, forKey: .meshMarkers) ?? []
         groupAreas = try container.decodeIfPresent([GroupArea].self, forKey: .groupAreas) ?? []
+        gates = try container.decodeIfPresent([LogicGate].self, forKey: .gates) ?? []
+        mode = try container.decodeIfPresent(SheetMode.self, forKey: .mode)
+        logicColumnOrder = try container.decodeIfPresent([String].self, forKey: .logicColumnOrder)
     }
 
     // MARK: Equivalent resistances
@@ -880,6 +1032,9 @@ nonisolated struct Circuit: Codable, Hashable {
         for ground in grounds {
             counts[ground.position, default: 0] += 1
         }
+        for gate in gates {
+            for terminal in gate.terminals { counts[terminal, default: 0] += 1 }
+        }
         // An endpoint landing in the middle of a wire forms a T-junction,
         // so the passing wire counts as two connections at that point.
         for point in counts.keys {
@@ -895,6 +1050,7 @@ nonisolated struct Circuit: Codable, Hashable {
     func isConnectionPoint(_ point: GridPoint) -> Bool {
         components.contains { $0.start == point || $0.end == point }
             || grounds.contains { $0.position == point }
+            || gates.contains { $0.terminals.contains(point) }
             || wires.contains { $0.start == point || $0.end == point || $0.passesThrough(point) }
     }
 
@@ -907,6 +1063,7 @@ nonisolated struct Circuit: Codable, Hashable {
         guard wire.start != wire.end else { return nil }
         if components.contains(where: { $0.start == point || $0.end == point }) { return nil }
         if grounds.contains(where: { $0.position == point }) { return nil }
+        if gates.contains(where: { $0.terminals.contains(point) }) { return nil }
         if wires.contains(where: { $0.passesThrough(point) }) { return nil }
         return index
     }
@@ -981,12 +1138,14 @@ nonisolated struct Circuit: Codable, Hashable {
         moveComponents([id: (newStart, newEnd)])
     }
 
-    /// Moves several components (new start and end per id) and ground symbols
-    /// (new position per id) at once. Wires in `excludedWires` are left alone;
-    /// the caller moves those itself.
+    /// Moves several components (new start and end per id), ground symbols
+    /// (new position per id) and logic gates (the gate as it is to be, which
+    /// may also be turned or have other inputs) at once. Wires in
+    /// `excludedWires` are left alone; the caller moves those itself.
     mutating func moveComponents(
         _ targets: [UUID: (start: GridPoint, end: GridPoint)],
         grounds groundTargets: [UUID: GridPoint] = [:],
+        gates gateTargets: [UUID: LogicGate] = [:],
         excludingWires excludedWires: Set<UUID> = []
     ) {
         var moves: [GridPoint: GridPoint] = [:]
@@ -1001,6 +1160,11 @@ nonisolated struct Circuit: Codable, Hashable {
             guard let target = groundTargets[grounds[index].id] else { continue }
             moves[grounds[index].position] = target
             grounds[index].position = target
+        }
+        for index in gates.indices {
+            guard let target = gateTargets[gates[index].id] else { continue }
+            moves.merge(gates[index].terminalMoves(to: target)) { $1 }
+            gates[index] = target
         }
         guard moves.contains(where: { $0.key != $0.value }) else { return }
 
@@ -1067,6 +1231,7 @@ nonisolated struct Circuit: Codable, Hashable {
         anchors.formUnion(probes.map(\.position))
         anchors.formUnion(probes.compactMap(\.negative))
         anchors.formUnion(grounds.map(\.position))
+        anchors.formUnion(gates.flatMap(\.terminals))
         return anchors
     }
 
@@ -1226,6 +1391,9 @@ nonisolated struct Circuit: Codable, Hashable {
         points += excludedAreas.flatMap { [$0.from, $0.to] }
         points += meshMarkers.map(\.position)
         points += groupAreas.flatMap { [$0.from, $0.to] }
+        points += gates.map { gate in
+            GridPoint(x: Int(gate.bounds.minX.rounded(.down)), y: Int(gate.bounds.minY.rounded(.down)))
+        }
         guard let minX = points.map(\.x).min(), let minY = points.map(\.y).min() else { return nil }
         return GridPoint(x: minX, y: minY)
     }
@@ -1273,6 +1441,9 @@ nonisolated struct Circuit: Codable, Hashable {
         for index in groupAreas.indices {
             groupAreas[index].from = groupAreas[index].from + offset
             groupAreas[index].to = groupAreas[index].to + offset
+        }
+        for index in gates.indices {
+            gates[index].position = gates[index].position + offset
         }
     }
 
@@ -1490,6 +1661,7 @@ extension Circuit {
             && currents == other.currents && grounds == other.grounds && senses == other.senses
             && equivalents == other.equivalents && textBoxes == other.textBoxes
             && inheritedValues == other.inheritedValues && excludedAreas == other.excludedAreas
+            && gates == other.gates && mode == other.mode && logicColumnOrder == other.logicColumnOrder
     }
 
     /// Every component, voltage point and current as (id, formula name, value, unit).
@@ -1637,6 +1809,22 @@ extension Circuit {
             if isClosed { result.wires.append(Wire(id: component.id, points: [component.start, component.end])) }
         }
         result.components.removeAll { $0.kind.isSwitch }
+        return result
+    }
+
+    /// The circuit with each signal generator at 0 Hz as the DC voltage source
+    /// it is: the value its waveform starts at (a sine A·cos φ, a square wave
+    /// A while it's high). The rest is then solved as if they weren't there.
+    func resolvingZeroFrequencyGenerators() -> Circuit {
+        guard components.contains(where: \.isZeroFrequency) else { return self }
+        var result = self
+        for index in result.components.indices where result.components[index].isZeroFrequency {
+            let generator = result.components[index]
+            result.components[index].kind = .voltageSource
+            result.components[index].value = generator.value.map {
+                generator.signalWaveform.value($0, duty: generator.dutyFraction, at: (generator.phase ?? 0) / 360)
+            }
+        }
         return result
     }
 

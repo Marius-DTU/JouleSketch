@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Step by step, how the missing voltages and currents are found with the
-/// node-voltage method, the mesh-current method or superposition.
+/// node-voltage method, the mesh-current method or superposition, or how an
+/// equivalent resistance is found.
 /// The method is chosen by the view showing it.
 struct WalkthroughView: View {
     let method: WalkMethod
@@ -21,7 +22,7 @@ struct WalkthroughView: View {
             }
         case .unavailable(let reason):
             ContentUnavailableView {
-                Label("\(method.title)smetoden kan ikke bruges", systemImage: "exclamationmark.triangle")
+                Label(method.unavailableTitle, systemImage: "exclamationmark.triangle")
             } description: {
                 Text(reason)
             }

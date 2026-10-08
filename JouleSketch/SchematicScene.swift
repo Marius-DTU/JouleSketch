@@ -95,7 +95,11 @@ nonisolated struct SheetTheme {
     var computed: SceneColor { isDark ? SceneColor(white: 0.62) : SceneColor(white: 0.47) }
     var equivalentSymbol: SceneColor { isDark ? SceneColor(white: 0.58) : SceneColor(white: 0.55) }
     var crosshair: SceneColor { isDark ? SceneColor(white: 0.7) : SceneColor(white: 0.35) }
+    /// Wires and inputs carrying a 1 on a digital sheet.
+    var logicHigh: SceneColor { isDark ? SceneColor(1.0, 0.72, 0.2) : SceneColor(0.92, 0.5, 0.0) }
     static let lit = SceneColor(1, 0.72, 0)
+    /// Warnings on the sheet, e.g. an LED with too much current.
+    static let warning = SceneColor(0.85, 0.2, 0.05)
 
     func penColor(_ index: Int) -> SceneColor {
         switch index {
@@ -141,12 +145,15 @@ struct SchematicScene {
     var resistorStyle = SceneResistorStyle.iec
     var showGrid = true
     var studyMode = false
+    /// The time in seconds, for LEDs blinking with a signal generator.
+    var time: Double = 0
     /// The sheet's size on screen.
     var size: CGSize
 
     private(set) var primitives: [ScenePrimitive] = []
 
-    private var solution: CircuitSolution { studyMode ? editor.solution.withoutValues : editor.solution }
+    /// The values to show, as they are at `time`; none in study mode.
+    private var solution = CircuitSolution()
     private var scale: CGFloat { editor.scale }
     private var offset: CGSize { editor.offset }
     private var spacing: CGFloat { CircuitEditor.gridSpacing }
@@ -163,6 +170,7 @@ struct SchematicScene {
 
     mutating func build() -> [ScenePrimitive] {
         primitives = []
+        solution = (studyMode ? editor.solution.withoutValues : editor.solution).at(time)
         drawPage()
         if showGrid { drawGrid() }
         drawGroupAreas()
@@ -276,7 +284,8 @@ struct SchematicScene {
         let lineWidth = max(1, 2 * scale)
 
         for wire in circuit.wires {
-            let color = editor.isSelected(.wire(wire.id)) ? theme.selection : theme.wire
+            // On a digital sheet, wires carrying a 1 light up.
+            let color = editor.isSelected(.wire(wire.id)) ? theme.selection : editor.isWireHigh(wire) == true ? theme.logicHigh : theme.wire
             stroke(polyline(wire.points.map(screenPoint)), color, width: lineWidth)
             for (index, segment) in wire.segments.enumerated() where editor.isSelected(.wireSegment(wire.id, index)) {
                 stroke([.move(screenPoint(segment.0)), .line(screenPoint(segment.1))], theme.selection, width: lineWidth * 1.5)
@@ -300,6 +309,11 @@ struct SchematicScene {
         for ground in circuit.grounds {
             let color = editor.isSelected(.ground(ground.id)) ? theme.selection : theme.component
             drawGround(at: ground.position, rotation: ground.rotation, color: color)
+        }
+
+        for gate in circuit.gates {
+            let color = editor.isSelected(.gate(gate.id)) ? theme.selection : theme.component
+            drawGate(gate, color: color, value: gate.kind.isGate ? nil : editor.logicValue(of: gate))
         }
 
         let dotRadius = max(2.5, unit * 0.2)
@@ -326,7 +340,7 @@ struct SchematicScene {
             let color = editor.isSelected(.probe(probe.id)) ? theme.selection : theme.probe
             let point = screenPoint(probe.position)
             drawProbe(at: point, color: color)
-            let runs = valueLabel(name: probe.name, value: probe.value, computed: solution.probeValues[probe.id], phase: solution.phases[probe.id], id: probe.id, unit: "V", color: color)
+            let runs = valueLabel(name: probe.name, value: probe.value, measured: solution.measurementText(probe.id, mode: probe.measure, unit: "V", at: time), unit: "V", color: color)
             text(runs, at: CGPoint(x: point.x + unit * 0.5, y: point.y - unit * 0.45), anchor: TextAnchor.bottomLeading)
         }
     }
@@ -336,8 +350,9 @@ struct SchematicScene {
         let b = screenPoint(component.end)
         drawComponent(
             component.kind, from: a, to: b, color: color, lineWidth: max(1, 2 * scale),
-            // A conducting LED is drawn lit.
-            isLit: component.kind == .led && solution.diodeConducts[component.id] == true,
+            // A conducting LED is drawn lit, blinking with a signal generator.
+            brightness: component.kind == .led ? solution.ledBrightness(component.id, at: time) : 0,
+            light: component.ledColor.light,
             waveform: component.signalWaveform,
             isClosed: editor.isClosed(component),
             isNormallyClosed: component.isNormallyClosed
@@ -371,6 +386,11 @@ struct SchematicScene {
         // Switches have no value, only their name.
         if component.kind.isSwitch {
             value = component.isNormallyClosed ? [TextRun(text: "NC", size: size, color: theme.label)] : []
+        }
+        // An LED shows only its name; its knee voltage is in its editor. One
+        // with too much current gets a warning instead.
+        if component.kind == .led {
+            value = solution.ledOvercurrent[component.id] == nil ? [] : [TextRun(text: "⚠ For meget strøm", size: size, weight: 600, color: SheetTheme.warning)]
         }
         if component.start.y == component.end.y {
             text(name, at: CGPoint(x: mid.x, y: mid.y - unit * 1.1), anchor: TextAnchor.bottom)
@@ -425,7 +445,7 @@ struct SchematicScene {
 
     private mutating func drawCurrentArrow(_ arrow: CurrentArrow, at point: CGPoint, direction: CGPoint, color: SceneColor) {
         drawArrowhead(at: point, direction: direction, size: unit * 0.9, color: color)
-        let runs = valueLabel(name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id], phase: solution.phases[arrow.id], id: arrow.id, unit: "A", color: color)
+        let runs = valueLabel(name: arrow.name, value: arrow.value, measured: solution.measurementText(arrow.id, mode: arrow.measure, unit: "A", at: time), unit: "A", color: color)
         if abs(direction.x) > abs(direction.y) {
             text(runs, at: CGPoint(x: point.x, y: point.y - unit * 0.55), anchor: TextAnchor.bottom)
         } else {
@@ -495,11 +515,8 @@ struct SchematicScene {
         if let value = probe.value {
             let valueColor = isLabelSelected ? color : (editor.isInherited(probe.name) ? theme.inherited : color)
             runs.append(TextRun(text: " = " + SIValue.format(value, unit: "V"), size: size, weight: 600, color: valueColor))
-        } else if let computed = solution.probeValues[probe.id] {
-            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: "V", phase: solution.phases[probe.id]), size: size, weight: 600, italic: true, color: theme.computed))
-        }
-        if let fundamental = solution.fundamentalText(probe.id, unit: "V") {
-            runs.append(TextRun(text: "  " + fundamental, size: size, weight: 600, italic: true, color: theme.computed))
+        } else if let measured = solution.measurementText(probe.id, mode: probe.measure, unit: "V", at: time) {
+            runs.append(TextRun(text: " = " + measured, size: size, weight: 600, italic: true, color: theme.computed))
         }
         text(runs, at: labelPoint, anchor: TextAnchor.center)
     }
@@ -615,18 +632,16 @@ struct SchematicScene {
 
     /// A "Name = value" label, or just the name while the value is unknown.
     private func valueLabel(
-        name: String, value: Double?, computed: Double?, phase: Double? = nil, id: UUID? = nil, unit valueUnit: String, color: SceneColor
+        name: String, value: Double?, measured: String?, unit valueUnit: String, color: SceneColor
     ) -> [TextRun] {
         let size = max(7, unit * 0.6)
         var runs = subscriptedName(name, size: size, weight: 500, color: color)
         if let value {
             let valueColor = editor.isInherited(name) ? theme.inherited : color
             runs.append(TextRun(text: " = " + SIValue.format(value, unit: valueUnit), size: size, color: valueColor))
-        } else if let computed {
-            runs.append(TextRun(text: " = " + SIValue.format(computed, unit: valueUnit, phase: phase), size: size, italic: true, color: theme.computed))
-        }
-        if let fundamental = id.flatMap({ solution.fundamentalText($0, unit: valueUnit) }) {
-            runs.append(TextRun(text: "  " + fundamental, size: size, italic: true, color: theme.computed))
+        } else if let measured {
+            // Computed, the way the voltage point or current picked (MeasureMode).
+            runs.append(TextRun(text: " = " + measured, size: size, italic: true, color: theme.computed))
         }
         return runs
     }
@@ -692,6 +707,19 @@ struct SchematicScene {
             drawMeshMarker(at: screenPoint(hoverPoint), name: editor.circuit.nextMeshName(), clockwise: editor.meshPlacementClockwise, color: theme.current)
             return
         }
+        // The inverter tool rings the terminal a click would invert.
+        if editor.tool == .invert, let location = interaction.hoverLocation,
+           let hit = editor.invertiblePin(near: worldPoint(location), tolerance: 12 / scale) {
+            opacity = 1
+            stroke([circle(screen(hit.center), max(6, unit * 0.45))], theme.selection, width: 1.5)
+            return
+        }
+        // A gate tool shows a ghost of the gate where it will be placed.
+        if case .gate(let kind) = editor.tool, let hoverPoint {
+            if case .cancelled = interaction.dragMode { return }
+            drawGate(ghostGate(kind, at: hoverPoint), color: theme.component, value: nil)
+            return
+        }
 
         guard case .drawing(let start, let current) = interaction.dragMode else { return }
         switch editor.tool {
@@ -729,9 +757,14 @@ struct SchematicScene {
             let path: [PathOp] = [.ellipse(rect(draft.start, draft.current))]
             fill(path, theme.power.opacity(0.08))
             stroke(path, theme.power, width: 1.5, dash: [6, 4], roundCap: false)
-        case .select, .current, .ground, .equivalent, .text:
+        case .select, .current, .ground, .equivalent, .text, .gate, .invert:
             break
         }
+    }
+
+    /// The gate a gate tool would place at `point`.
+    private func ghostGate(_ kind: GateKind, at point: GridPoint) -> LogicGate {
+        editor.newGate(kind, at: point)
     }
 
     /// An L-shaped path, horizontal first, matching how wires are created.
@@ -787,15 +820,22 @@ struct SchematicScene {
     }
 
     private mutating func drawComponent(
-        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false,
-        waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
+        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, brightness: Double = 0,
+        light: SceneColor = SheetTheme.lit, waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
     ) {
         paint {
             $0.component(
-                kind, from: a, to: b, color: color, lineWidth: lineWidth, isLit: isLit,
+                kind, from: a, to: b, color: color, lineWidth: lineWidth, brightness: brightness, light: light,
                 waveform: waveform, isClosed: isClosed, isNormallyClosed: isNormallyClosed
             )
         }
+    }
+
+    private mutating func drawGate(_ gate: LogicGate, color: SceneColor, value: Bool?) {
+        let point = screenPoint(gate.position)
+        let width = max(1, 2 * scale)
+        let high = theme.logicHigh, label = theme.label
+        paint { $0.gate(gate, at: point, color: color, lineWidth: width, value: value, high: high, textColor: label) }
     }
 
     private mutating func drawArrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: SceneColor) {
@@ -850,8 +890,8 @@ nonisolated struct SymbolPainter {
     /// A two-terminal component between `a` and `b`.
     /// The symbol body is centered and 2 grid units long; leads fill the rest.
     mutating func component(
-        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, isLit: Bool = false,
-        waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
+        _ kind: ComponentKind, from a: CGPoint, to b: CGPoint, color: SceneColor, lineWidth: CGFloat, brightness: Double = 0,
+        light: SceneColor = SheetTheme.lit, waveform: SignalWaveform = .sine, isClosed: Bool = false, isNormallyClosed: Bool = false
     ) {
         let length = a.distance(to: b)
         guard length > 0 else { return }
@@ -892,12 +932,12 @@ nonisolated struct SymbolPainter {
             let tip = center + size
             stroke([.move(p(center - halfBody, 0)), .line(p(base, 0)), .move(p(tip, 0)), .line(p(center + halfBody, 0))], color, width: lineWidth)
             let triangle: [PathOp] = [.move(p(base, -size)), .line(p(tip, 0)), .line(p(base, size)), .close]
-            if isLit { fill(triangle, SheetTheme.lit.opacity(0.45)) }
+            if brightness > 0 { fill(triangle, light.opacity(0.45 * brightness)) }
             stroke(triangle, color, width: lineWidth)
             stroke([.move(p(tip, -size)), .line(p(tip, size))], color, width: lineWidth)
 
             if kind == .led {
-                let arrowColor = isLit ? SheetTheme.lit : color
+                let arrowColor = brightness > 0 ? light.opacity(0.3 + 0.7 * brightness) : color
                 let head = size * 0.35
                 for offset in [-size * 0.45, size * 0.25] {
                     let from = (x: center + offset, y: -size * 1.15)
@@ -1007,6 +1047,146 @@ nonisolated struct SymbolPainter {
                 ], color, width: lineWidth)
             }
         }
+    }
+
+    /// A logic gate, input or output, with `gate.position` at `origin` on
+    /// screen. Gates are drawn with the distinctive (ANSI) shapes. `value` is
+    /// an input's or output's value (`nil`: unknown), drawn in `high` when 1.
+    mutating func gate(
+        _ gate: LogicGate, at origin: CGPoint, color: SceneColor, lineWidth: CGFloat,
+        value: Bool? = nil, high: SceneColor = SheetTheme.lit, textColor: SceneColor? = nil
+    ) {
+        let (dx, dy) = gate.direction
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: origin.x + (x * dx - y * dy) * unit, y: origin.y + (x * dy + y * dx) * unit)
+        }
+        func polygon(_ points: [CGPoint]) -> [PathOp] {
+            guard let first = points.first else { return [] }
+            return [.move(first)] + points.dropFirst().map { .line($0) } + [.close]
+        }
+        func line(_ a: CGPoint, _ b: CGPoint) -> [PathOp] { [.move(a), .line(b)] }
+        let textColor = textColor ?? color
+        let size = max(6, unit * 0.6)
+        let bubbleRadius = unit * 0.22
+        /// A lead from `x0` to `x1` at height `y`, broken by an inverting
+        /// circle where the terminal has one.
+        func lead(_ pin: LogicGate.Pin, from x0: CGFloat, to x1: CGFloat, y: CGFloat) -> [PathOp] {
+            let hasCircle = pin == .output ? gate.showsOutputBubble : gate.isInverted(pin)
+            guard hasCircle else { return line(p(x0, y), p(x1, y)) }
+            let center = CGFloat(gate.bubbleCenter(pin).x)
+            let r: CGFloat = 0.22
+            bubble(at: p(center, y), radius: bubbleRadius, color: color, lineWidth: lineWidth)
+            return (x0 < center - r ? line(p(x0, y), p(center - r, y)) : []) + (x1 > center + r ? line(p(center + r, y), p(x1, y)) : [])
+        }
+
+        switch gate.kind {
+        case .input:
+            let box = polygon([p(-3, -0.7), p(-0.6, -0.7), p(-0.6, 0.7), p(-3, 0.7)])
+            fill(box, (value == true ? high : color).opacity(value == true ? 0.2 : 0.06))
+            stroke(box, color, width: lineWidth)
+            stroke(lead(.output, from: -0.6, to: 0, y: 0), color, width: lineWidth)
+            text(gate.name, size: size, color: textColor, at: p(-2.2, 0), anchor: TextAnchor.center)
+            let center = p(-1.2, 0), half = unit * 0.36
+            let square: [PathOp] = [.roundedRect(CGRect(x: center.x - half, y: center.y - half, width: half * 2, height: half * 2), radius: half * 0.3)]
+            if value == true { fill(square, high) }
+            stroke(square, color, width: max(1, lineWidth * 0.6))
+            text(value == true ? "1" : "0", size: size * 0.85, color: value == true ? SceneColor(white: 1) : textColor, at: center, anchor: TextAnchor.center)
+        case .output:
+            stroke(lead(.input(0), from: 0, to: 0.6, y: 0), color, width: lineWidth)
+            let box = polygon([p(0.6, -0.7), p(3, -0.7), p(3, 0.7), p(0.6, 0.7)])
+            fill(box, (value == true ? high : color).opacity(value == true ? 0.2 : 0.06))
+            stroke(box, color, width: lineWidth)
+            let lamp = p(1.2, 0)
+            let radius = unit * 0.36
+            let circle: PathOp = .ellipse(CGRect(x: lamp.x - radius, y: lamp.y - radius, width: radius * 2, height: radius * 2))
+            if value == true { fill([circle], high) }
+            stroke([circle], color, width: max(1, lineWidth * 0.6))
+            text(value.map { $0 ? "1" : "0" } ?? "?", size: size * 0.85, color: value == true ? SceneColor(white: 1) : textColor, at: lamp, anchor: TextAnchor.center)
+            text(gate.name, size: size, color: textColor, at: p(2.2, 0), anchor: TextAnchor.center)
+        case .high:
+            // A flag: a stem up to a bar, with "5V" above it.
+            stroke(line(p(0, 0), p(0, -1)) + line(p(-0.7, -1), p(0.7, -1)), color, width: lineWidth)
+            text("5V", size: size, color: textColor, at: p(0, -1.65), anchor: TextAnchor.center)
+        case .low:
+            // The ground symbol: a stem down to three bars getting narrower.
+            stroke(line(p(0, 0), p(0, 0.9)) + line(p(-0.7, 0.9), p(0.7, 0.9))
+                + line(p(-0.45, 1.2), p(0.45, 1.2)) + line(p(-0.2, 1.5), p(0.2, 1.5)), color, width: lineWidth)
+        case .block:
+            let rows = CGFloat(gate.blockRows)
+            let right = CGFloat(gate.blockLength)
+            let box = polygon([p(1, -1), p(right - 1, -1), p(right - 1, rows), p(1, rows)])
+            fill(box, color.opacity(0.04))
+            stroke(box, color, width: lineWidth)
+            var leads: [PathOp] = []
+            for row in gate.inputOffsets { leads += lead(.input(row), from: 0, to: 1, y: CGFloat(row)) }
+            for row in gate.blockOutputRows { leads += lead(.blockOutput(row), from: right - 1, to: right, y: CGFloat(row)) }
+            stroke(leads, color, width: lineWidth)
+            // The names read inwards from the sides of the box, upright
+            // however the block is turned.
+            let inward = CGPoint(x: 0.5 - 0.5 * dx, y: 0.5 - 0.5 * dy)
+            let outward = CGPoint(x: 0.5 + 0.5 * dx, y: 0.5 + 0.5 * dy)
+            for row in gate.inputOffsets {
+                text(gate.blockPinName(.input(row)), size: size, color: textColor, at: p(1.25, CGFloat(row)), anchor: inward)
+            }
+            for row in gate.blockOutputRows {
+                text(gate.blockPinName(.blockOutput(row)), size: size, color: textColor, at: p(right - 1.25, CGFloat(row)), anchor: outward)
+            }
+            text(gate.name, size: size * 1.15, color: textColor, at: p(1, rows + 0.15), anchor: CGPoint(x: 0.5 - 0.5 * dx + 0.5 * dy, y: 0.5 - 0.5 * dy - 0.5 * dx))
+        case .not:
+            stroke(lead(.input(0), from: 0, to: 1, y: 0), color, width: lineWidth)
+            stroke(polygon([p(1, -1), p(3.55, 0), p(1, 1)]), color, width: lineWidth)
+            stroke(lead(.output, from: 3.55, to: 5, y: 0), color, width: lineWidth)
+        default:
+            let h = CGFloat(gate.bodyHalfHeight)
+            let isOR = gate.kind == .or || gate.kind == .nor || gate.kind == .xor || gate.kind == .xnor
+            let isXOR = gate.kind == .xor || gate.kind == .xnor
+            /// Where the curved back of an OR gate is at height `y`.
+            func back(_ y: CGFloat) -> CGFloat { 1 + 0.45 * cos(.pi / 2 * y / h) }
+            let steps = 16
+            var body: [CGPoint] = []
+            if isOR {
+                for step in 0...steps {
+                    let t = CGFloat(step) / CGFloat(steps)
+                    body.append(p(1 + 3 * t, -h * (1 - t * t)))
+                }
+                for step in (0...steps).reversed() {
+                    let t = CGFloat(step) / CGFloat(steps)
+                    body.append(p(1 + 3 * t, h * (1 - t * t)))
+                }
+                for step in 1..<steps {
+                    let y = h - 2 * h * CGFloat(step) / CGFloat(steps)
+                    body.append(p(back(y), y))
+                }
+            } else {
+                body.append(p(1, -h))
+                for step in 0...steps {
+                    let angle = -CGFloat.pi / 2 + .pi * CGFloat(step) / CGFloat(steps)
+                    body.append(p(2.5 + 1.5 * cos(angle), h * sin(angle)))
+                }
+                body.append(p(1, h))
+            }
+            stroke(polygon(body), color, width: lineWidth)
+            if isXOR {
+                let curve = (0...steps).map { step -> CGPoint in
+                    let y = -h + 2 * h * CGFloat(step) / CGFloat(steps)
+                    return p(back(y) - 0.4, y)
+                }
+                stroke([.move(curve[0])] + curve.dropFirst().map { .line($0) }, color, width: lineWidth)
+            }
+            var leads: [PathOp] = []
+            for offset in gate.inputOffsets {
+                let y = CGFloat(offset)
+                let end = isOR ? back(y) - (isXOR ? 0.4 : 0) : 1
+                leads += lead(.input(offset), from: 0, to: end, y: y)
+            }
+            stroke(leads, color, width: lineWidth)
+            stroke(lead(.output, from: 4, to: 5, y: 0), color, width: lineWidth)
+        }
+    }
+
+    /// The small circle at an inverting gate's output.
+    private mutating func bubble(at center: CGPoint, radius: CGFloat, color: SceneColor, lineWidth: CGFloat) {
+        stroke([circle(center, radius)], color, width: lineWidth)
     }
 
     /// One period of a signal generator's waveform for its symbol, with x and
@@ -1145,6 +1325,36 @@ enum ToolIconScene {
             painter.fill([.roundedRect(box, radius: 2)], color.opacity(0.15))
             painter.stroke([.roundedRect(box, radius: 2)], color, width: 1.2)
             painter.fill([.rect(CGRect(x: box.minX, y: box.minY, width: box.width * 0.45, height: 4))], color)
+        case .tool(.gate(let kind)):
+            switch kind {
+            case .input:
+                painter.unit = 6.5
+                painter.gate(LogicGate(kind: kind, position: GridPoint(x: 0, y: 0), name: "A"), at: CGPoint(x: size.width - 2, y: middle.y), color: color, lineWidth: 1.3)
+            case .output:
+                painter.unit = 6.5
+                painter.gate(LogicGate(kind: kind, position: GridPoint(x: 0, y: 0), name: "Y"), at: CGPoint(x: 3, y: middle.y), color: color, lineWidth: 1.3)
+            case .high, .low:
+                painter.unit = 7
+                let terminal = CGPoint(x: middle.x, y: kind == .high ? middle.y + 8 : middle.y - 7)
+                painter.gate(LogicGate(kind: kind, position: GridPoint(x: 0, y: 0)), at: terminal, color: color, lineWidth: 1.4)
+            case .block:
+                // A box with two inputs on the left and an output on the right.
+                let box = CGRect(x: middle.x - 6, y: middle.y - 8, width: 12, height: 16)
+                painter.stroke([.rect(box)], color, width: 1.4)
+                painter.stroke([
+                    .move(CGPoint(x: box.minX - 5, y: middle.y - 4)), .line(CGPoint(x: box.minX, y: middle.y - 4)),
+                    .move(CGPoint(x: box.minX - 5, y: middle.y + 4)), .line(CGPoint(x: box.minX, y: middle.y + 4)),
+                    .move(CGPoint(x: box.maxX, y: middle.y)), .line(CGPoint(x: box.maxX + 5, y: middle.y)),
+                ], color, width: 1.4)
+            default:
+                painter.unit = 5.2
+                painter.gate(LogicGate(kind: kind, position: GridPoint(x: 0, y: 0)), at: CGPoint(x: 2, y: middle.y), color: color, lineWidth: 1.4)
+            }
+        case .tool(.invert):
+            // A line with an inverting circle in it.
+            let radius: CGFloat = 3.6
+            painter.stroke([.move(a), .line(CGPoint(x: middle.x - radius, y: middle.y)), .move(CGPoint(x: middle.x + radius, y: middle.y)), .line(b)], color, width: 1.5)
+            painter.stroke([.ellipse(CGRect(x: middle.x - radius, y: middle.y - radius, width: radius * 2, height: radius * 2))], color, width: 1.5)
         case .tool(.text):
             // Like the SF Symbol "character.textbox".
             painter.stroke([.roundedRect(CGRect(x: middle.x - 8, y: middle.y - 6, width: 16, height: 12), radius: 2.5)], color, width: 1.2)

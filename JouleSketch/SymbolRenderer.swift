@@ -13,7 +13,8 @@ enum SymbolRenderer {
         color: Color,
         lineWidth: CGFloat,
         resistorStyle: ResistorStyle = .iec,
-        isLit: Bool = false,
+        brightness: Double = 0,
+        light: Color = litColor,
         waveform: SignalWaveform = .sine,
         isClosed: Bool = false,
         isNormallyClosed: Bool = false,
@@ -77,7 +78,7 @@ enum SymbolRenderer {
             triangle.addLine(to: CGPoint(x: tip, y: 0))
             triangle.addLine(to: CGPoint(x: base, y: size))
             triangle.closeSubpath()
-            if isLit { local.fill(triangle, with: .color(litColor.opacity(0.45))) }
+            if brightness > 0 { local.fill(triangle, with: .color(light.opacity(0.45 * brightness))) }
             local.stroke(triangle, with: .color(color), style: style)
 
             var bar = Path()
@@ -87,7 +88,7 @@ enum SymbolRenderer {
 
             if kind == .led {
                 // Two arrows for the emitted light, bright when the LED is on.
-                let arrowColor = isLit ? litColor : color
+                let arrowColor = brightness > 0 ? light.opacity(0.3 + 0.7 * brightness) : color
                 let head = size * 0.35
                 for offset in [-size * 0.45, size * 0.25] {
                     let from = CGPoint(x: center + offset, y: -size * 1.15)
@@ -251,6 +252,13 @@ enum SymbolRenderer {
 
     /// The color of a lit LED.
     static let litColor = Color(red: 1, green: 0.72, blue: 0)
+    /// Warnings on the sheet, e.g. an LED with too much current.
+    static let warningColor = Color(red: 0.85, green: 0.2, blue: 0.05)
+
+    /// The light of a lit LED of a color.
+    static func light(_ color: LEDColor) -> Color {
+        Color(red: color.light.r, green: color.light.g, blue: color.light.b)
+    }
 
     /// Draws a filled arrowhead centered on `point`, pointing along `direction` (a unit vector).
     static func drawCurrentArrowhead(at point: CGPoint, direction: CGPoint, size: CGFloat, color: Color, in context: GraphicsContext) {
@@ -334,6 +342,12 @@ struct ToolIcon: View {
             let b = CGPoint(x: size.width - 2, y: size.height / 2)
             let unit = size.width / 4.5
             switch tool {
+            case .gate, .invert:
+                // Logic symbols come from the shared drawing code.
+                ScenePrimitiveRenderer.draw(
+                    ToolIconScene.primitives(for: .tool(tool), color: SceneColor(white: 0), resistorStyle: .iec),
+                    in: context, tint: color
+                )
             case .select:
                 var image = context.resolve(Image(systemName: "cursorarrow"))
                 image.shading = .color(color)

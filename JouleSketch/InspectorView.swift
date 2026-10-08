@@ -85,6 +85,16 @@ struct InspectorView: View {
                     GroupAreaSection(editor: editor, group: group)
                     Section { deleteButton }
                 }
+            case .gate(let id):
+                if let gate = editor.gate(id: id) {
+                    Section(gate.kind.displayName) {
+                        GateFields(editor: editor, gate: gate)
+                        Button("Rotér (R)", systemImage: "rotate.right") {
+                            editor.rotateGate(id: id)
+                        }
+                        deleteButton
+                    }
+                }
             case .group(let items):
                 Section("\(items.count) elementer markeret") {
                     deleteButton
@@ -117,7 +127,12 @@ struct InspectorView: View {
                 ) { newValue in
                     editor.updateComponent(id: component.id) { $0.value = newValue }
                 }
-                .id(component.id)
+                // Picking an LED color fills in a new value.
+                .id([component.id.uuidString, component.color?.rawValue ?? ""])
+            }
+
+            if component.kind == .led {
+                LEDColorPicker(editor: editor, component: component)
             }
 
             if component.kind.isDependent {
@@ -175,6 +190,7 @@ struct InspectorView: View {
                 editor.updateProbe(id: probe.id) { $0.value = newValue }
             }
             .id(probe.id)
+            MeasurePicker(mode: probe.measure) { mode in editor.updateProbe(id: probe.id) { $0.measure = mode } }
             NoteField(text: Binding(
                 get: { probe.note },
                 set: { newNote in editor.updateProbe(id: probe.id) { $0.note = newNote } }
@@ -204,6 +220,7 @@ struct InspectorView: View {
                 editor.updateCurrentArrow(id: arrow.id) { $0.value = newValue }
             }
             .id(arrow.id)
+            MeasurePicker(mode: arrow.measure) { mode in editor.updateCurrentArrow(id: arrow.id) { $0.measure = mode } }
             NoteField(text: Binding(
                 get: { arrow.note },
                 set: { newNote in editor.updateCurrentArrow(id: arrow.id) { $0.note = newNote } }
@@ -409,6 +426,42 @@ struct SwitchStateField: View {
                  : "Trykknappen er åben og lukker, mens du holder den nede med Vælg-værktøjet.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// What a voltage point or current shows of a value that changes with a
+/// signal generator: as worked out, right now, average, RMS or peak.
+struct MeasurePicker: View {
+    let mode: MeasureMode?
+    let onChange: (MeasureMode?) -> Void
+
+    var body: some View {
+        Picker("Vis", selection: Binding(
+            get: { mode ?? .auto },
+            set: { onChange($0 == .auto ? nil : $0) }
+        )) {
+            ForEach(MeasureMode.allCases) { Text($0.displayName).tag($0) }
+        }
+        Text("Med en signalgenerator: øjebliksværdien svinger med signalet, middel og RMS er som et multimeter på DC og AC.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// An LED's color; picking one sets its knee voltage.
+struct LEDColorPicker: View {
+    let editor: CircuitEditor
+    let component: CircuitComponent
+
+    var body: some View {
+        Picker("Farve", selection: Binding(
+            get: { component.ledColor },
+            set: { editor.setLEDColor($0, id: component.id) }
+        )) {
+            ForEach(LEDColor.allCases) { color in
+                Text("\(color.displayName) (\(SIValue.format(color.kneeVoltage, unit: "V")))").tag(color)
+            }
         }
     }
 }

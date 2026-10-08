@@ -85,7 +85,7 @@ private struct Words {
 
     var sections: [GuideSection] {
         [
-            welcome, quickStart, sheet, palette, components, wires, values, ground,
+            welcome, startPage, quickStart, digital, truthTable, calculator, sheet, palette, components, wires, values, ground,
             measuring, calculation, walkthrough, textBoxes, groups, editing,
             drawing, files, settings, shortcuts, troubleshooting,
         ]
@@ -96,8 +96,75 @@ private struct Words {
     var welcome: GuideSection {
         GuideSection(id: "welcome", title: "Velkommen til JouleSketch", blocks: [
             .text("JouleSketch er et program til at tegne og regne elektriske kredsløb. Du tegner diagrammet på et ark med gitter, skriver de værdier på, du kender, og så finder programmet resten: **spændinger, strømme, effekter og manglende komponentværdier**."),
-            .text("Programmet kan også vise udregningen **trin for trin** (knudepunkts-, maske- og superpositionsmetoden) og lave **Maple-kode**, som du kan sætte direkte ind i en afleveringsopgave."),
+            .text("Programmet kan også vise udregningen **trin for trin** (knudepunkts-, maske- og superpositionsmetoden og den samlede modstand) og lave **Maple-kode**, som du kan sætte direkte ind i en afleveringsopgave."),
+            .text("Et ark kan også være **digitalt**: så tegner du med logiske gates (AND, OR, NOT, NAND, NOR, XOR, XNOR), og programmet laver sandhedstabeller og Karnaugh-kort og finder de gates, en sandhedstabel kræver."),
             .tip(isWeb ? "Du kan altid åbne denne guide igen med **ⓘ** øverst til højre, ved siden af Indstillinger." : "Du kan altid åbne denne guide igen under **Sådan bruger du JouleSketch** i menuen ⋯ Visning."),
+        ])
+    }
+
+    var startPage: GuideSection {
+        let new = switch platform {
+        case .mac: "Når du opretter et nyt kredsløb (⌘N)"
+        case .touch: "Når du opretter et nyt kredsløb"
+        case .web: "Når du klikker på **Ny**"
+        }
+        return GuideSection(id: "startPage", title: "Analog eller digital", blocks: [
+            .text("\(new), viser programmet en startside, hvor du vælger, hvad arket skal bruges til:"),
+            .bullets([
+                "**Analog** – modstande, kilder, dioder, kondensatorer og spoler. Programmet beregner spændinger og strømme og viser udregningen og Maple-koden. Det er det, resten af guiden handler om.",
+                "**Digital** – logiske gates med samme gitter og samme ledningsværktøj. Programmet laver sandhedstabeller og Karnaugh-kort for det, du tegner, og har en lommeregner, der finder de gates, en sandhedstabel kræver.",
+            ]),
+            .tip("Valget gemmes i filen. Filer fra før der var et valg, åbner som analoge ark."),
+        ])
+    }
+
+    var digital: GuideSection {
+        GuideSection(id: "digital", title: "Digitale kredsløb", blocks: [
+            .text("På et digitalt ark har paletten **Vælg**, **Ledning**, **Logiske gates**, **Indgange og udgange**, **5V og GND**, **Blok**, **Invertér** og **Tekst**. Ledninger tegnes og forbindes præcis som på et analogt ark."),
+            .bullets([
+                "**Gates:** AND\(shortcut(.andGate)), OR\(shortcut(.orGate)), NOT\(shortcut(.notGate)), NAND\(shortcut(.nandGate)), NOR\(shortcut(.norGate)), XOR\(shortcut(.xorGate)) og XNOR\(shortcut(.xnorGate)). \(Click) for at placere en gate; indgangene sidder til venstre og udgangen til højre.\(isTouch ? "" : " \(key(.rotate)) roterer gaten, før og efter du har placeret den.")",
+                "**Antal indgange:** en gate (undtagen NOT) kan have 2 til 8 indgange. Ret det i gatens egenskaber; ledningerne følger med.",
+                "**Indgang\(shortcut(.logicInput)):** et navngivet signal (A, B, C …), som er 0 eller 1. \(Click) på den med Vælg-værktøjet for at skifte mellem 0 og 1. Indgange med samme navn er det samme signal, så et signal kan bruges flere steder på arket.",
+                "**Udgang\(shortcut(.logicOutput)):** et navngivet resultat (Y …). Lampen viser den værdi, der kommer ind i udgangen.",
+                "**5V\(shortcut(.logicHigh)) og GND\(shortcut(.logicLow)):** flag for forsyningen. Det, der forbindes til 5V, er altid 1, og det, der forbindes til GND, er altid 0 – fx en indgang på en gate, der altid skal være høj, eller C-in på en adder. Alle 5V-flag er det samme signal, og det samme gælder GND. De kan også bruges inde i en blok.",
+                "**Blok\(shortcut(.logicBlock)):** en firkant (et modul, som en IC, fx 74283) med navngivne indgange til venstre og udgange til højre. Skriv navnene i blokkens egenskaber, ét pr. linje; en tom linje giver et mellemrum. Blokken hedder U1, U2 … og kan omdøbes.",
+                "**Blokkens indhold:** \(doubleClick) på blokken for at gå ind i den og bygge, hvad den gør, med gates på et ark for sig. Inde i blokken står en indgang og en udgang for hvert af blokkens ben, og dem bygger du med. Benene bestemmes kun i blokkens egenskaber (højreklik på blokken): tilføjer, omdøber eller sletter du et ben dér, følger indgangene og udgangene inde i blokken med, næste gang du går ind. Inde i blokken kan der ikke sættes andre indgange og udgange. Øverst står vejen ind (Ark › U1); \(click) på et navn eller på ‹\(isTouch ? "" : ", eller tryk på Esc eller \(key(.leaveBlock))"), for at gå ud igen. Blokken regnes med i simuleringen og sandhedstabellen ude på arket, og blokke kan ligge inde i blokke. Fortryd virker både inde i og uden for blokken. En blok uden indhold har ingen værdi på udgangene.",
+                "**Bibliotek:** gem en blok med dens indhold med **Gem i biblioteket** i blokkens egenskaber (eller markér den og vælg **Gem markeret blok** under **Bibliotek** i værktøjslinjen). Under **Bibliotek** placerer du blokke igen på ethvert digitalt ark (vælg **Placér**, og \(click) på arket), sletter dem, og eksporterer hele biblioteket eller én blok til en fil, som kan importeres på en anden computer. En importeret blok med samme navn som en, du har, erstatter den.",
+                "**Invertér\(shortcut(.invertPin)):** \(click) på en indgang eller udgang på en gate (eller på en indgang eller udgang på arket) for at sætte en lille cirkel på stregen, så signalet vendes (0 bliver 1, og 1 bliver 0). \(Click) igen for at fjerne cirklen. En cirkel på udgangen af en NAND gør den til en AND, og en NOT uden cirkel er en buffer.",
+            ]),
+            .text("Kredsløbet simuleres hele tiden: ledninger, der fører et **1**, lyser orange, så du kan følge signalet gennem gatene, mens du skifter indgangene."),
+            .tip("Gatene tegnes med de amerikanske (ANSI) symboler. En lille cirkel ved udgangen betyder, at gaten vender signalet (NOT, NAND, NOR, XNOR)."),
+        ])
+    }
+
+    var truthTable: GuideSection {
+        let open = isWeb ? "Klik på **Sandhedstabel** i værktøjslinjen" : "\(Click) på **Sandhedstabel** (tabellen) i værktøjslinjen"
+        return GuideSection(id: "truthTable", title: "Sandhedstabel og Karnaugh-kort", blocks: [
+            .text("\(open). Panelet ved siden af arket har to faner: **Kredsløbet** og **Lommeregner**."),
+            .text("Under **Kredsløbet** står sandhedstabellen for det, du har tegnet: en række for hver kombination af indgangene (A er den mest betydende bit) og en søjle for hver udgang. Den følger med, mens du tegner."),
+            .bullets([
+                "**Udtrykket fra tegningen** er det, gatene beregner, læst gate for gate.",
+                "**Det mindste udtryk** er fundet med et Karnaugh-kort (2–4 indgange) eller Quine–McCluskey (flere). Vælg mellem **SOP** (sum af produkter, ud fra ettallerne) og **POS** (produkt af summer, ud fra nullerne).",
+                "**Karnaugh-kortet** viser grupperne i hver sin farve, og **trinene** under det forklarer, hvorfor hver gruppe giver sit led – hvilke variable der skifter og forsvinder, og hvilke der er fælles.",
+                "Har kredsløbet flere udgange, vælger du, hvilken der vises.",
+                "**Flyt kolonner:** træk i en kolonneoverskrift\(isTouch ? "" : " (eller højreklik på den)") for at flytte en indgang eller udgang, fx så E står først. Den første indgang er den mest betydende bit, så rækkernes numre, Karnaugh-kortet og udtrykket følger med. Rækkefølgen gemmes i filen.",
+                "**m-område:** skriv et område, fx [0,9], så vises kun de rækker. Et område under 0, fx [-8,7], læser indgangene som et tal med fortegn (2-komplement), så rækkerne står fra −8 til 7. Det virker også i lommeregneren.",
+                "**Brug i lommeregneren** kopierer udgangens sandhedstabel over i lommeregneren, så du kan arbejde videre med den.",
+            ]),
+            .tip("Står der, at en indgang ikke får noget signal, mangler en ledning. Sandhedstabellen kan ikke laves for kredsløb med tilbagekobling (løkker)."),
+        ])
+    }
+
+    var calculator: GuideSection {
+        GuideSection(id: "calculator", title: "Lommeregneren", blocks: [
+            .text("Under **Lommeregner** i sandhedstabel-panelet skriver du selv en sandhedstabel, og programmet finder de gates, der skal til for at opfylde den."),
+            .bullets([
+                "Vælg **antal indgange** (1–6). Indgangene hedder A, B, C …, og udgangen kan omdøbes.",
+                "\(Click) på udgangens felt i en række for at skifte mellem **0**, **1** og **X** (don't care – programmet vælger selv, hvad der giver det simpleste udtryk). Knapperne **Alle 0**, **Alle 1** og **Alle X** fylder hele søjlen.",
+                "Resultatet står med det samme: det mindste udtryk, en liste over de gates, du skal bruge, Karnaugh-kortet med grupperne og udregningen trin for trin.",
+                "**Tegn kredsløbet på arket** tegner gatene ved siden af det, der allerede står på arket, færdigt forbundet. Prøv det af ved at klikke på indgangene.",
+            ]),
+            .tip("Kredsløbet tegnes så enkelt som muligt: inverterede indgange får en lille cirkel i stedet for en NOT-gate, og kan det klares med én gate (AND, OR, NAND, NOR, XOR eller XNOR), bruges den – fx er A + B̄ + C̄ én NAND-gate. Ellers bruges én gate pr. gruppe og én, der samler grupperne (OR for SOP, AND for POS). Under **Du skal bruge** står, hvad der tegnes."),
         ])
     }
 
@@ -225,9 +292,11 @@ private struct Words {
             .text("Præfikserne er p (piko), n (nano), µ eller u (mikro), m (milli), k (kilo), M (mega) og G (giga)."),
             .bullets([
                 "**Tomt felt = ukendt.** Programmet prøver at finde de ukendte værdier ud fra dem, du kender.",
+                "Mens et symbols editor er åben, regnes der ikke; det, du har skrevet, regnes ud, når du trykker **Færdig** eller lukker editoren.",
                 "En **modstand** viser de nærmeste standardværdier fra E-rækkerne (IEC 60063) og deres farvekode.",
-                "En **signalgenerator** har amplitude, frekvens, fase og bølgeform (sinus eller firkant med duty cycle).",
-                "En **diode** eller **lysdiode** har en fast spænding, når den leder (0,7 V og 2 V som standard).",
+                "En **signalgenerator** har amplitude, frekvens, fase og bølgeform (sinus eller firkant med duty cycle). Ved **0 Hz** regnes den som en jævnspændingskilde.",
+                "En **diode** har en fast spænding, når den leder (0,7 V som standard).",
+                "En **lysdiode** har en farve – rød, gul, blå eller hvid – som sætter dens knæspænding (1,8 V, 1,9 V, 2,7 V og 2,7 V). Den kan også skrives ind selv. På tegningen står kun dens navn.",
                 "Hvert symbol kan få en **note**, som vises på tegningen.",
             ]),
         ])
@@ -247,9 +316,10 @@ private struct Words {
                 "**Spændingspunkt\(shortcut(.probe)):** \(click) på en ledning. Punktet får et navn (VA, VB …) og viser spændingen i forhold til stel.",
                 "**Spændingsfald:** \(isWeb ? "slå Spændingsfald (+ og −) til øverst på arket, eller hold Ctrl og træk fra et punkt" : isTouch ? "hold ⌘ på et tilsluttet tastatur" : "⌘-klik på spændingspunkt-værktøjet, eller hold ⌘ og træk fra et punkt"), og træk så fra + til −. Det viser spændingen mellem to vilkårlige punkter.",
                 "**Strøm i ledning\(shortcut(.current)):** \(click) på en ledning for at sætte en strømpil. Træk langs ledningen for at vælge retningen\(isTouch ? "" : ", eller tryk \(key(.rotate)) for at vende den").",
+                "**Målemåde:** i editoren for et spændingspunkt, spændingsfald eller en strømpil vælger du under **Vis**, hvad der står, når en signalgenerator får værdien til at ændre sig: **Automatisk** (amplitude ∠ fase, eller middelværdi og grundtone), **Øjebliksværdi** (svinger med signalet under \(SIValue.format(SignalTimeline.steadyFrequency, unit: "Hz")); hurtigere vises RMS), **Middelværdi** og **RMS** (som et multimeter på DC og AC) eller **Spidsværdi**.",
                 "**Maskestrøm\(shortcut(.mesh)):** \(click) inde i en maske. Pilen viser maskestrømmen med eller mod uret\(isTouch ? "" : " – \(key(.rotate)) vender retningen"). Navn og retning bruges af maskestrømsmetoden.",
                 "**Effekt\(shortcut(.power)):** træk en cirkel om en eller flere komponenter for at se den samlede afsatte effekt. \(Click) på en enkelt komponent slår dens effektcirkel til og fra.",
-                "**Samlet modstand, Req\(shortcut(.equivalent)):** \(click) på det første punkt (A) og så det andet (B). Req er modstanden set mellem de to punkter, med spændingskilder kortsluttet og strømkilder afbrudt.",
+                "**Samlet modstand, Req\(shortcut(.equivalent)):** \(click) på det første punkt (A) og så det andet (B). Req er modstanden set mellem de to punkter, med spændingskilder kortsluttet og strømkilder afbrudt. Fanen **Samlet modstand** i gennemgangen viser, hvordan den findes.",
             ]),
         ])
     }
@@ -262,10 +332,13 @@ private struct Words {
             .text("**DC og AC:**"),
             .bullets([
                 "Uden signalgenerator regnes der **DC**: en kondensator er en afbrydelse, og en spole er en kortslutning.",
-                "Med en **signalgenerator** regnes der med fasorer: kondensatorer og spoler får deres impedans, og spændinger og strømme vises som amplitude ∠ fase.",
+                "Med en **signalgenerator** regnes der med fasorer: kondensatorer og spoler får deres impedans, og spændinger og strømme vises som amplitude ∠ fase. Det gælder kun den del af kredsløbet, generatoren er forbundet til (stel tæller ikke); løse dele regnes for sig.",
                 "En **firkant** (PWM) regnes som middelværdi (D · højspænding) og grundtone, så du kan se, hvor meget der er tilbage af signalet efter fx et RC-filter.",
                 "En firkant sat til 0 V er en **low-side udgang (LSO)**: åben i duty cyclen og trukket til stel resten af perioden.",
                 "**Dioder** regnes med en fast spænding, og programmet finder selv ud af, om de leder eller spærrer.",
+                "En **lysdiode** spærrer under sin knæspænding og leder derover gennem en indre modstand på \(SIValue.format(LEDModel.resistance, unit: "Ω")), så strømmen stiger med spændingen. Den lyser kraftigere med mere strøm, som øjet ser det: et par mA lyser tydeligt, og ved \(SIValue.format(LEDModel.ratedCurrent, unit: "A")) er den fuldt tændt. Får den mere, står der **⚠ For meget strøm** ved den, og beregningsrapporten viser en advarsel: sæt en formodstand.",
+                "Med en signalgenerator og **dioder** følges signalet øjeblik for øjeblik over en periode, så en diode kun leder den ene vej. Under \(SIValue.format(SignalTimeline.steadyFrequency, unit: "Hz")) viser tegningen spændinger og strømme, som de er lige nu, og en lysdiode blinker i takt med signalet. Derover vises middelværdien over perioden, og lysdioden lyser konstant med sin gennemsnitlige lysstyrke (for en firkant følger den duty cyclen). I editoren står middelværdierne.",
+                "Grundtonen (efter ~) vises kun, hvor der er noget af den.",
             ]),
             .text("**Study mode** skjuler de beregnede værdier, så du kan regne selv først, men stadig kan se, om alt kan beregnes. \(isWeb ? "Slå den til under Indstillinger (⚙)." : "Slå den til med kontakten i værktøjslinjen eller i menuen ⋯ Visning.")"),
         ])
@@ -279,6 +352,7 @@ private struct Words {
                 "**Knudepunkt** – Kirchhoffs strømlov i hvert knudepunkt med strømmene skrevet med Ohms lov.",
                 "**Maske** – Kirchhoffs spændingslov rundt i hver maske. Kræver et plant diagram (ingen ledninger, der krydser).",
                 "**Superposition** – hver kilde regnes for sig, og bidragene lægges sammen.",
+                "**Samlet modstand** – vises, når der er sat en Req på tegningen: kilderne slukkes, og modstandene lægges sammen i serie og parallel trin for trin. Kan nettet ikke deles op sådan (fx en bro), sendes en teststrøm på 1 A ind i A og ud i B, og Req findes med knudepunktsligninger.",
             ]),
             .text("Under gennemgangen står **Maple-koden**: kendte værdier med enheder, navngivne ligninger og de resultater, du har bedt om (med spændingspunkter, strømpile, effekter osv.)."),
             .bullets([
@@ -394,7 +468,7 @@ private struct Words {
                     ? "**Udseende:** gitterprikker og arkets størrelse i gitterpunkter."
                     : "**Udseende:** baggrund (fx papir eller en egen farve), gitterprikker og arkets størrelse i gitterpunkter.",
                 "**Symboler:** modstande som europæisk rektangel (IEC) eller amerikansk zigzag (ANSI).",
-                "**Tastaturgenveje:** alle værktøjsgenveje kan ændres. Taster, der bruges to steder, bliver markeret.",
+                "**Tastaturgenveje:** alle værktøjsgenveje kan ændres. Taster, der bruges to steder på samme slags ark, bliver markeret; analoge og digitale værktøjer må gerne dele en tast.",
             ] + (isWeb ? ["**Study mode:** skjul de beregnede værdier."] : [])),
         ])
     }
@@ -405,7 +479,14 @@ private struct Words {
             .text(isTouch
                 ? "Med et tastatur tilsluttet virker de samme genveje som på Mac. Dine nuværende genveje er:"
                 : "Dine nuværende genveje (de kan ændres under Indstillinger). De virker, når arket er aktivt:"),
-            .keys(tools.map { (key($0), $0.displayName) }),
+            .keys(tools.map { action in
+                let sheet = switch action.mode {
+                case .analog?: " (analog)"
+                case .digital?: " (digital)"
+                case nil: ""
+                }
+                return (key(action), action.displayName + sheet)
+            }),
             .text("I et tekstfelt:"),
             .keys(KeyAction.allCases.filter(\.usesCommand).map { (key($0), $0.displayName) }),
         ]

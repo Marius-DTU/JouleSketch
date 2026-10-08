@@ -36,6 +36,8 @@ final class SheetInteraction {
 
     private(set) var dragMode: DragMode = .idle
     private(set) var hoverPoint: GridPoint?
+    /// Where the pointer is on screen, unsnapped.
+    private(set) var hoverLocation: CGPoint?
     /// The freehand line being drawn in drawing mode, in grid units.
     private(set) var currentStroke: [CGPoint] = []
     /// The circle being drawn with the power tool, on screen.
@@ -109,10 +111,12 @@ final class SheetInteraction {
     func hover(at location: CGPoint?) {
         guard let location else {
             hoverPoint = nil
+            hoverLocation = nil
             eraserLocation = nil
             return
         }
         hoverPoint = snap(location)
+        hoverLocation = location
         eraserLocation = editor.isDrawing && editor.isErasing ? location : nil
     }
 
@@ -224,7 +228,7 @@ final class SheetInteraction {
         case .power:
             powerDraft = (location, location)
             dragMode = .drawing(start: start, current: start)
-        case .component, .ground, .current, .equivalent, .mesh, .groupArea:
+        case .component, .ground, .current, .equivalent, .mesh, .groupArea, .gate, .invert:
             dragMode = .drawing(start: start, current: start)
         }
     }
@@ -294,6 +298,10 @@ final class SheetInteraction {
                 editor.equivalentClick(at: current, hit: editor.hitTest(worldPoint(startLocation), tolerance: 8 / scale))
             case .ground:
                 editor.addGround(at: current)
+            case .gate(let kind):
+                editor.addGate(kind, at: current)
+            case .invert:
+                editor.toggleInversion(near: worldPoint(startLocation), tolerance: 12 / scale)
             case .text:
                 editor.addTextBox(at: start)
             case .mesh:
@@ -339,6 +347,10 @@ final class SheetInteraction {
                 if let toggle = editor.switchComponent(tapSelection), toggle.kind == .toggleSwitch {
                     editor.toggleSwitch(id: toggle.id)
                 }
+                // Clicking an input switches it between 0 and 1.
+                if let input = editor.logicInput(tapSelection) {
+                    editor.toggleInput(id: input.id)
+                }
                 handleTap(on: tapSelection)
             }
         case .resizingGroup(_, _, _, let didBegin):
@@ -355,10 +367,12 @@ final class SheetInteraction {
     }
 
     /// Opens the symbol editor when the same symbol is tapped twice in quick succession.
+    /// A double-click opens the item's editor, or goes into a block's
+    /// sub-diagram (its editor is opened with a right-click).
     private func handleTap(on item: Selection) {
         let now = Date()
         if let lastTap, lastTap.item == item, now.timeIntervalSince(lastTap.time) < 0.4, isEditable(item) {
-            openEditor(for: item)
+            if !editor.enterIfBlock(item) { openEditor(for: item) }
             self.lastTap = nil
         } else {
             lastTap = (item, now)
@@ -373,7 +387,7 @@ final class SheetInteraction {
            hypot(location.x - lastToolTap.location.x, location.y - lastToolTap.location.y) < 6 {
             self.lastToolTap = nil
             editor.restore(lastToolTap.before)
-            openEditor(for: lastToolTap.item)
+            if !editor.enterIfBlock(lastToolTap.item) { openEditor(for: lastToolTap.item) }
             return true
         }
         if let hit = editor.hitTest(worldPoint(location), tolerance: 8 / scale), isEditable(hit) {
@@ -446,6 +460,10 @@ final class SheetInteraction {
             guard let probe = editor.probe(id: id), let label = editor.voltageDropLabelPosition(of: probe) else { return nil }
             let p = CGPoint(x: label.x * unit + offset.width, y: label.y * unit + offset.height)
             return CGRect(x: p.x - unit, y: p.y - unit / 2, width: unit * 2, height: unit)
+        case .gate(let id):
+            guard let gate = editor.gate(id: id) else { return nil }
+            let bounds = gate.bounds
+            return CGRect(x: bounds.minX * unit + offset.width, y: bounds.minY * unit + offset.height, width: bounds.width * unit, height: bounds.height * unit)
         default:
             return nil
         }

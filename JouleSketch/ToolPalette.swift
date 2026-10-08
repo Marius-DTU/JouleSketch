@@ -83,7 +83,7 @@ struct ToolPalette: View {
 
     private var toolButtons: some View {
         HStack(spacing: 4) {
-            ForEach(ToolGroup.allCases) { group in
+            ForEach(ToolGroup.palette(for: editor.sheetMode, insideBlock: editor.isInsideBlock)) { group in
                 groupButton(group)
             }
         }
@@ -210,6 +210,7 @@ struct ToolPalette: View {
     /// Hints for touch screens, without keyboard shortcuts.
     private func touchHint(for tool: Tool) -> String {
         switch tool {
+        case .select where editor.isDigital: "Tryk vælger · tryk to gange redigerer · træk markerer · tryk på en indgang skifter mellem 0 og 1 · to fingre flytter visningen"
         case .select: "Tryk vælger · tryk to gange redigerer · træk markerer · tryk på en kontakt skifter den · hold en trykknap nede · to fingre flytter visningen"
         case .wire:
             editor.isRouting
@@ -235,12 +236,20 @@ struct ToolPalette: View {
         case .mesh: "Tryk inde i en maske for at vise dens maskestrøm og retning"
         case .power: "Tegn en cirkel om en komponent for at vise effekten i den · tryk på en komponent slår cirklen til og fra"
         case .groupArea: "Træk en boks om et kredsløb for at gøre det til en gruppe i Maple-vinduet"
+        case .gate(.input): "Tryk for at placere en indgang · tryk på den med Vælg for at skifte mellem 0 og 1"
+        case .gate(.output): "Tryk for at placere en udgang · den viser værdien, der kommer ind i den"
+        case .gate(.block): "Tryk for at placere en blok · navngiv dens indgange og udgange i egenskaberne"
+        case .gate(.high): "Tryk for at placere 5V · det, der forbindes til den, er altid 1"
+        case .gate(.low): "Tryk for at placere GND · det, der forbindes til den, er altid 0"
+        case .gate: "Tryk for at placere gaten · indgangene sidder til venstre og udgangen til højre"
+        case .invert: "Tryk på en indgang eller udgang for at invertere den med en lille cirkel · tryk igen for at fjerne den"
         }
     }
 
     /// Hints for mouse and trackpad, with keyboard shortcuts.
     private func pointerHint(for tool: Tool) -> String {
         switch tool {
+        case .select where editor.isDigital: "Klik vælger · ⌘-klik tilføjer · dobbeltklik redigerer (en blok åbnes) · træk markerer · klik på en indgang skifter mellem 0 og 1 · to fingre flytter visningen"
         case .select: "Klik vælger · ⌘-klik tilføjer · dobbeltklik redigerer · træk markerer · klik på en kontakt skifter den · hold en trykknap nede · to fingre flytter visningen"
         case .wire:
             editor.isRouting
@@ -268,6 +277,20 @@ struct ToolPalette: View {
             "Klik inde i en maske for at vise maskestrømmen (\(editor.meshPlacementClockwise ? "med uret" : "mod uret")) · R vender retningen"
         case .groupArea:
             "Træk en boks om et kredsløb for at gøre det til en gruppe i Maple-vinduet · dobbeltklik på navnet for at omdøbe"
+        case .gate(.input):
+            "Klik for at placere en indgang · R roterer · klik på den med Vælg for at skifte mellem 0 og 1"
+        case .gate(.output):
+            "Klik for at placere en udgang · R roterer · den viser værdien, der kommer ind i den"
+        case .gate(.block):
+            "Klik for at placere en blok · R roterer · navngiv dens indgange og udgange i egenskaberne"
+        case .gate(.high):
+            "Klik for at placere 5V · R roterer · det, der forbindes til den, er altid 1"
+        case .gate(.low):
+            "Klik for at placere GND · R roterer · det, der forbindes til den, er altid 0"
+        case .gate:
+            "Klik for at placere gaten · R roterer · antal indgange ændres i egenskaberne"
+        case .invert:
+            "Klik på en indgang eller udgang for at invertere den med en lille cirkel · klik igen for at fjerne den"
         case .text:
             "Klik for at indsætte et tekstfelt · \(commandHint(.textMode)) tekst · \(commandHint(.mathMode)) math (LaTeX) · \(commandHint(.evaluateMath)) udregner · \(commandHint(.unitBrackets)) enhed"
         }
@@ -369,7 +392,7 @@ private struct GlassContainer<Content: View>: View {
     }
 }
 
-private extension View {
+extension View {
     /// Liquid Glass capsule on iOS/macOS 26+, a material capsule on older systems.
     @ViewBuilder
     func glassBackground() -> some View {

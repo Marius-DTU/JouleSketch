@@ -53,7 +53,7 @@ final class CircuitDocument: Document {
 
     @MainActor
     func snapshot(contentType: UTType) async throws -> sending Circuit {
-        editor.circuit
+        editor.documentCircuit
     }
 }
 
@@ -71,7 +71,7 @@ final class LegacyCircuitDocument: ReferenceFileDocument {
     }
 
     func snapshot(contentType: UTType) throws -> Circuit {
-        editor.circuit
+        editor.documentCircuit
     }
 
     func fileWrapper(snapshot: Circuit, configuration: WriteConfiguration) throws -> FileWrapper {

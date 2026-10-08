@@ -1,5 +1,25 @@
 import SwiftUI
 
+/// The moments a signal generator changes something on the sheet (an LED
+/// blinking, a value shown as it is right now), so it's redrawn then and
+/// not every frame. Just once when nothing changes over time.
+struct SignalSchedule: TimelineSchedule {
+    let solution: CircuitSolution
+    /// Whether a value is shown as it is right now, changing smoothly.
+    var continuous = false
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = startDate
+        return AnyIterator {
+            guard let current = next else { return nil }
+            // A moment after the change, so the new piece of the period is drawn.
+            next = solution.nextRedraw(after: current.timeIntervalSinceReferenceDate, continuous: continuous)
+                .map { Date(timeIntervalSinceReferenceDate: $0 + 0.001) }
+            return current
+        }
+    }
+}
+
 /// The dotted drawing sheet. Handles rendering, snapping, drawing, moving,
 /// panning and zooming.
 struct SchematicCanvas: View {
@@ -16,9 +36,17 @@ struct SchematicCanvas: View {
     @AppStorage(SettingsKey.studyMode) private var studyMode = false
 
     /// The computed values to show; none in study mode.
-    private var solution: CircuitSolution { studyMode ? editor.solution.withoutValues : editor.solution }
+    private var solution: CircuitSolution { frameSolution ?? (studyMode ? editor.solution.withoutValues : editor.solution) }
+    /// The values as they are in the frame being drawn (`at(_:)`), set on
+    /// the copy of the view that draws it.
+    private var frameSolution: CircuitSolution?
+    /// The time of the frame being drawn (seconds), for values shown as they
+    /// are right now.
+    private var frameTime: Double = 0
 
     @State private var hoverPoint: GridPoint?
+    /// Where the pointer is on screen, unsnapped.
+    @State private var hoverLocation: CGPoint?
     @State private var dragMode: DragMode = .idle
     /// The freehand line being drawn in drawing mode, in grid units.
     @State private var currentStroke: [CGPoint] = []
@@ -107,18 +135,25 @@ struct SchematicCanvas: View {
     }
 
     var body: some View {
-        Canvas { context, size in
-            drawPage(in: context, size: size)
-            if showGrid { drawGrid(in: context, size: size) }
-            drawGroupAreas(in: context)
-            drawCircuit(in: context)
-            drawExcludedAreas(in: context)
-            drawGroupHandles(in: context)
-            drawStrokes(in: context)
-            drawEraser(in: context)
-            drawPreview(in: context)
-            drawSelectionRect(in: context)
-            drawCrosshair(in: context, size: size)
+        // Redrawn only when a signal generator changes something on the sheet.
+        TimelineView(SignalSchedule(solution: editor.solution, continuous: editor.hasContinuousMeasurement)) { timeline in
+            Canvas { context, size in
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                var frame = self
+                frame.frameSolution = solution.at(time)
+                frame.frameTime = time
+                frame.drawPage(in: context, size: size)
+                if showGrid { frame.drawGrid(in: context, size: size) }
+                frame.drawGroupAreas(in: context)
+                frame.drawCircuit(in: context, time: time)
+                frame.drawExcludedAreas(in: context)
+                frame.drawGroupHandles(in: context)
+                frame.drawStrokes(in: context)
+                frame.drawEraser(in: context)
+                frame.drawPreview(in: context)
+                frame.drawSelectionRect(in: context)
+                frame.drawCrosshair(in: context, size: size)
+            }
         }
         .background(theme.sheet)
         #if os(macOS)
@@ -139,9 +174,11 @@ struct SchematicCanvas: View {
             switch phase {
             case .active(let location):
                 hoverPoint = snap(location)
+                hoverLocation = location
                 eraserLocation = editor.isDrawing && editor.isErasing ? location : nil
             case .ended:
                 hoverPoint = nil
+                hoverLocation = nil
                 eraserLocation = nil
             }
         }
@@ -252,12 +289,13 @@ struct SchematicCanvas: View {
             return .handled
         }
         guard press.modifiers.isDisjoint(with: [.command, .control, .option]) else { return .ignored }
-        guard let action = KeyBindings(storageString: keyBindingsStorage).action(for: press.characters) else {
+        guard let action = KeyBindings(storageString: keyBindingsStorage).action(for: press.characters, mode: editor.sheetMode) else {
             return .ignored
         }
         switch action {
         case .rotate: editor.rotate()
         case .selectWholeWire: editor.selectWholeWires()
+        case .leaveBlock: editor.leaveBlock()
         default:
             if let tool = action.tool { editor.tool = tool }
         }
@@ -471,7 +509,7 @@ struct SchematicCanvas: View {
         case .power:
             powerDraft = (location, location)
             dragMode = .drawing(start: start, current: start)
-        case .component, .ground, .current, .equivalent, .mesh, .groupArea:
+        case .component, .ground, .current, .equivalent, .mesh, .groupArea, .gate, .invert:
             dragMode = .drawing(start: start, current: start)
         }
     }
@@ -551,6 +589,10 @@ struct SchematicCanvas: View {
                 editor.equivalentClick(at: current, hit: editor.hitTest(worldPoint(value.startLocation), tolerance: 8 / scale))
             case .ground:
                 editor.addGround(at: current)
+            case .gate(let kind):
+                editor.addGate(kind, at: current)
+            case .invert:
+                editor.toggleInversion(near: worldPoint(value.startLocation), tolerance: 12 / scale)
             case .text:
                 editor.addTextBox(at: start)
             case .mesh:
@@ -596,6 +638,10 @@ struct SchematicCanvas: View {
                 if let toggle = editor.switchComponent(tapSelection), toggle.kind == .toggleSwitch {
                     editor.toggleSwitch(id: toggle.id)
                 }
+                // Clicking an input switches it between 0 and 1.
+                if let input = editor.logicInput(tapSelection) {
+                    editor.toggleInput(id: input.id)
+                }
                 handleTap(on: tapSelection)
             }
         case .resizingGroup(_, _, _, let didBegin):
@@ -613,10 +659,12 @@ struct SchematicCanvas: View {
     }
 
     /// Opens the symbol editor when the same symbol is tapped twice in quick succession.
+    /// A double-click opens the item's editor, or goes into a block's
+    /// sub-diagram (its editor is opened with a right-click).
     private func handleTap(on item: Selection) {
         let now = Date()
         if let lastTap, lastTap.item == item, now.timeIntervalSince(lastTap.time) < 0.4, isEditable(item) {
-            openEditor(for: item)
+            if !editor.enterIfBlock(item) { openEditor(for: item) }
             self.lastTap = nil
         } else {
             lastTap = (item, now)
@@ -632,7 +680,7 @@ struct SchematicCanvas: View {
            hypot(location.x - lastToolTap.location.x, location.y - lastToolTap.location.y) < 6 {
             self.lastToolTap = nil
             editor.restore(lastToolTap.before)
-            openEditor(for: lastToolTap.item)
+            if !editor.enterIfBlock(lastToolTap.item) { openEditor(for: lastToolTap.item) }
             return true
         }
         // Remember taps on editable symbols (before this tap draws anything).
@@ -707,6 +755,10 @@ struct SchematicCanvas: View {
             guard let probe = editor.probe(id: id), let label = editor.voltageDropLabelPosition(of: probe) else { return nil }
             let p = CGPoint(x: label.x * unit + offset.width, y: label.y * unit + offset.height)
             return CGRect(x: p.x - unit, y: p.y - unit / 2, width: unit * 2, height: unit)
+        case .gate(let id):
+            guard let gate = editor.gate(id: id) else { return nil }
+            let bounds = gate.bounds
+            return CGRect(x: bounds.minX * unit + offset.width, y: bounds.minY * unit + offset.height, width: bounds.width * unit, height: bounds.height * unit)
         default:
             return nil
         }
@@ -797,14 +849,16 @@ struct SchematicCanvas: View {
         context.fill(major, with: .color(theme.gridMajor))
     }
 
-    private func drawCircuit(in context: GraphicsContext) {
+    /// `time` is in seconds, for LEDs blinking with a signal generator.
+    private func drawCircuit(in context: GraphicsContext, time: Double) {
         let circuit = editor.circuit
         let lineWidth = max(1, 2 * scale)
 
         for wire in circuit.wires {
             var path = Path()
             path.addLines(wire.points.map(screenPoint))
-            let color = editor.isSelected(.wire(wire.id)) ? theme.selection : theme.wire
+            // On a digital sheet, wires carrying a 1 light up.
+            let color = editor.isSelected(.wire(wire.id)) ? theme.selection : editor.isWireHigh(wire) == true ? theme.logicHigh : theme.wire
             context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round))
 
             for (index, segment) in wire.segments.enumerated() where editor.isSelected(.wireSegment(wire.id, index)) {
@@ -819,7 +873,7 @@ struct SchematicCanvas: View {
             let isSelected = editor.isSelected(.component(component.id))
             // Resistors in a Req keep the Req's color.
             let groupColor = editor.equivalentColorIndex(ofResistor: component.id).map(theme.groupColor)
-            drawComponent(component, color: isSelected ? theme.selection : groupColor ?? theme.component, in: context)
+            drawComponent(component, color: isSelected ? theme.selection : groupColor ?? theme.component, time: time, in: context)
         }
 
         for component in circuit.components where component.isPowerShown {
@@ -833,6 +887,12 @@ struct SchematicCanvas: View {
         for ground in circuit.grounds {
             let color = editor.isSelected(.ground(ground.id)) ? theme.selection : theme.component
             drawGround(at: ground.position, rotation: ground.rotation, color: color, in: context)
+        }
+
+        for gate in circuit.gates {
+            let scene = theme.scene
+            let color = editor.isSelected(.gate(gate.id)) ? scene.selection : scene.component
+            drawGate(gate, color: color, value: gate.kind.isGate ? nil : editor.logicValue(of: gate), in: context)
         }
 
         let dotRadius = max(2.5, unit * 0.2)
@@ -866,7 +926,7 @@ struct SchematicCanvas: View {
             let point = screenPoint(probe.position)
             SymbolRenderer.drawProbe(at: point, unit: unit, color: color, in: context)
             drawValueLabel(
-                name: probe.name, value: probe.value, computed: solution.probeValues[probe.id], phase: solution.phases[probe.id], id: probe.id,
+                name: probe.name, value: probe.value, measured: solution.measurementText(probe.id, mode: probe.measure, unit: "V", at: frameTime),
                 unit: "V", color: color, in: context
             ) { text in
                 context.draw(text, at: CGPoint(x: point.x + unit * 0.5, y: point.y - unit * 0.45), anchor: .bottomLeading)
@@ -874,14 +934,15 @@ struct SchematicCanvas: View {
         }
     }
 
-    private func drawComponent(_ component: CircuitComponent, color: Color, in context: GraphicsContext) {
+    private func drawComponent(_ component: CircuitComponent, color: Color, time: Double, in context: GraphicsContext) {
         let a = screenPoint(component.start)
         let b = screenPoint(component.end)
         SymbolRenderer.drawComponent(
             component.kind, from: a, to: b, unit: unit, color: color,
             lineWidth: max(1, 2 * scale), resistorStyle: resistorStyle,
-            // A conducting LED is drawn lit.
-            isLit: component.kind == .led && solution.diodeConducts[component.id] == true,
+            // A conducting LED is drawn lit, blinking with a signal generator.
+            brightness: component.kind == .led ? solution.ledBrightness(component.id, at: time) : 0,
+            light: SymbolRenderer.light(component.ledColor),
             waveform: component.signalWaveform,
             isClosed: editor.isClosed(component),
             isNormallyClosed: component.isNormallyClosed,
@@ -916,6 +977,13 @@ struct SchematicCanvas: View {
         // Switches have no value, only their name.
         if component.kind.isSwitch {
             value = Text(component.isNormallyClosed ? "NC" : "").font(font).foregroundStyle(theme.label)
+        }
+        // An LED shows only its name; its knee voltage is in its editor. One
+        // with too much current gets a warning instead.
+        if component.kind == .led {
+            value = solution.ledOvercurrent[component.id] == nil
+                ? Text("")
+                : Text("⚠ For meget strøm").font(font.weight(.semibold)).foregroundStyle(SymbolRenderer.warningColor)
         }
         if component.start.y == component.end.y {
             context.draw(name, at: CGPoint(x: mid.x, y: mid.y - unit * 1.1), anchor: .bottom)
@@ -984,7 +1052,7 @@ struct SchematicCanvas: View {
         SymbolRenderer.drawCurrentArrowhead(at: point, direction: direction, size: unit * 0.9, color: color, in: context)
 
         drawValueLabel(
-            name: arrow.name, value: arrow.value, computed: solution.currentValues[arrow.id], phase: solution.phases[arrow.id], id: arrow.id,
+            name: arrow.name, value: arrow.value, measured: solution.measurementText(arrow.id, mode: arrow.measure, unit: "A", at: frameTime),
             unit: "A", color: color, in: context
         ) { text in
             if abs(direction.x) > abs(direction.y) {
@@ -993,6 +1061,15 @@ struct SchematicCanvas: View {
                 context.draw(text, at: CGPoint(x: point.x + unit * 0.55, y: point.y), anchor: .leading)
             }
         }
+    }
+
+    /// A logic gate, input or output, drawn by the shared `SymbolPainter`
+    /// like on the web.
+    private func drawGate(_ gate: LogicGate, color: SceneColor, value: Bool?, in context: GraphicsContext) {
+        var painter = SymbolPainter(unit: unit)
+        let scene = theme.scene
+        painter.gate(gate, at: screenPoint(gate.position), color: color, lineWidth: max(1, 2 * scale), value: value, high: scene.logicHigh, textColor: scene.label)
+        ScenePrimitiveRenderer.draw(painter.primitives, in: context)
     }
 
     private func drawGround(at position: GridPoint, rotation: Int, color: Color, in context: GraphicsContext) {
@@ -1100,11 +1177,8 @@ struct SchematicCanvas: View {
         if let value = probe.value {
             let valueColor = isLabelSelected ? color : (editor.isInherited(probe.name) ? theme.inherited : color)
             text = Text("\(text)\(Text(" = " + SIValue.format(value, unit: "V")).font(font).foregroundStyle(valueColor))")
-        } else if let computed = solution.probeValues[probe.id] {
-            text = Text("\(text)\(Text(" = " + SIValue.format(computed, unit: "V", phase: solution.phases[probe.id])).font(font.italic()).foregroundStyle(theme.computed))")
-        }
-        if let fundamental = solution.fundamentalText(probe.id, unit: "V") {
-            text = Text("\(text)\(Text("  " + fundamental).font(font.italic()).foregroundStyle(theme.computed))")
+        } else if let measured = solution.measurementText(probe.id, mode: probe.measure, unit: "V", at: frameTime) {
+            text = Text("\(text)\(Text(" = " + measured).font(font.italic()).foregroundStyle(theme.computed))")
         }
         context.draw(text, at: labelPoint, anchor: .center)
     }
@@ -1292,25 +1366,24 @@ struct SchematicCanvas: View {
     /// A "Name = value" label, or just the name while the value is unknown.
     /// A value the calculation filled in is shown in grey italics.
     private func drawValueLabel(
-        name: String, value: Double?, computed: Double?, phase: Double? = nil, id: UUID? = nil, unit valueUnit: String, color: Color,
+        name: String, value: Double?, measured: String?, unit valueUnit: String, color: Color,
         in context: GraphicsContext, place: (Text) -> Void
     ) {
         let size = max(7, unit * 0.6)
         let font = Font.system(size: size, weight: .medium)
         let nameText = subscriptedName(name, font: font, size: size, weight: .medium, color: color)
-        // With PWM the fundamental follows the average: "~ 0,4 V ∠ −80°".
-        let fundamental = id.flatMap { solution.fundamentalText($0, unit: valueUnit) }
-            .map { Text("  " + $0).font(font.italic()).foregroundStyle(theme.computed) } ?? Text("")
         if let value {
             // A value given by a "!name := …" line in a text box is shown in purple.
             let valueColor = editor.isInherited(name) ? theme.inherited : color
             let valueText = Text(" = " + SIValue.format(value, unit: valueUnit)).font(font).foregroundStyle(valueColor)
-            place(Text("\(nameText)\(valueText)\(fundamental)"))
-        } else if let computed {
-            let valueText = Text(" = " + SIValue.format(computed, unit: valueUnit, phase: phase)).font(font.italic()).foregroundStyle(theme.computed)
-            place(Text("\(nameText)\(valueText)\(fundamental)"))
+            place(Text("\(nameText)\(valueText)"))
+        } else if let measured {
+            // Computed, the way the voltage point or current picked (MeasureMode),
+            // e.g. "2 V ∠ 30°  ~ 0,4 V ∠ −80°" or "7,07 V rms".
+            let valueText = Text(" = " + measured).font(font.italic()).foregroundStyle(theme.computed)
+            place(Text("\(nameText)\(valueText)"))
         } else {
-            place(Text("\(nameText)\(fundamental)"))
+            place(nameText)
         }
     }
 
@@ -1380,6 +1453,24 @@ struct SchematicCanvas: View {
             drawMeshMarker(at: screenPoint(hoverPoint), name: editor.circuit.nextMeshName(), clockwise: editor.meshPlacementClockwise, color: theme.current, in: preview)
             return
         }
+        // The inverter tool rings the terminal a click would invert.
+        if editor.tool == .invert, let hoverLocation,
+           let hit = editor.invertiblePin(near: worldPoint(hoverLocation), tolerance: 12 / scale) {
+            let center = CGPoint(x: hit.center.x * unit + offset.width, y: hit.center.y * unit + offset.height)
+            let radius = max(6, unit * 0.45)
+            context.stroke(
+                Path(ellipseIn: CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)),
+                with: .color(theme.selection), lineWidth: 1.5
+            )
+            return
+        }
+        // A gate tool shows a ghost of the gate where it will be placed.
+        if case .gate(let kind) = editor.tool, let hoverPoint {
+            if case .cancelled = dragMode { return }
+            let ghost = editor.newGate(kind, at: hoverPoint)
+            drawGate(ghost, color: theme.scene.component, value: nil, in: preview)
+            return
+        }
 
         guard case .drawing(let start, let current) = dragMode else { return }
         switch editor.tool {
@@ -1420,7 +1511,7 @@ struct SchematicCanvas: View {
             let circle = Path(ellipseIn: CGRect(p1: draft.start, p2: draft.current))
             preview.fill(circle, with: .color(theme.power.opacity(0.08)))
             preview.stroke(circle, with: .color(theme.power), style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
-        case .select, .current, .ground, .equivalent, .text:
+        case .select, .current, .ground, .equivalent, .text, .gate, .invert:
             break
         }
     }
@@ -1498,7 +1589,7 @@ struct SchematicTheme {
     let colorScheme: ColorScheme
 
     /// Whether the sheet is dark, so lines and text need light colors.
-    private var isDark: Bool {
+    var isDark: Bool {
         switch background {
         case .system: colorScheme == .dark
         case .paper, .white, .gray: false
@@ -1567,6 +1658,10 @@ struct SchematicTheme {
     }
 
     var crosshair: Color { isDark ? Color(white: 0.7) : Color(white: 0.35) }
+    /// Wires carrying a 1 on a digital sheet.
+    var logicHigh: Color { Color(scene.logicHigh) }
+    /// The same colors for the shared drawing code (logic symbols).
+    var scene: SheetTheme { SheetTheme(isDark: isDark) }
 }
 
 private extension CGRect {
